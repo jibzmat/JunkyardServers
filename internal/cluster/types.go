@@ -48,33 +48,83 @@ func ParseRoles(s string) ([]Role, error) {
 	return out, nil
 }
 
-// Tier says how far the cluster trusts a node with plaintext.
+// Tier says how far the cluster trusts a node's owner.
 type Tier string
 
 const (
-	// TierConfidential: attested SEV-SNP or TDX; any tenant's guests may run here.
-	TierConfidential Tier = "confidential"
-	// TierTrusted: the owner vouched for this PC; plaintext allowed.
+	// TierTrusted: the owner vouched for this PC (it is one of yours).
 	TierTrusted Tier = "trusted"
-	// TierStorageOnly: a stranger's PC; holds ciphertext and relays only.
-	TierStorageOnly Tier = "storage-only"
+	// TierConfidential: a stranger's PC with attested SEV-SNP or TDX, so
+	// guest RAM is encrypted by the CPU and hidden from the host owner.
+	TierConfidential Tier = "confidential"
+	// TierUntrusted: a stranger's PC without memory encryption. It offers
+	// the same storage and compute features; only encrypted RAM is missing,
+	// so its owner could read the memory of guests it runs.
+	TierUntrusted Tier = "untrusted"
 )
 
-// MayDecrypt reports whether a node in this tier may ever hold plaintext
-// tenant data or keys.
-func (t Tier) MayDecrypt() bool { return t == TierConfidential || t == TierTrusted }
-
 // AllowedRoles filters requested roles down to the ones the tier permits.
-// Untrusted nodes never run guests, gateways or the control plane, because
-// all of those see keys or plaintext.
+// Storage and compute are open to every tier: storage only ever holds
+// ciphertext, and where a guest may run is the tenant's choice (Placement).
+// The control plane and gateways hold the CA key, key-service shares and
+// every tenant's data keys, so they run only on owner-trusted PCs. SEV-SNP
+// and TDX protect guests, not host processes, so confidential PCs don't
+// qualify either.
 func (t Tier) AllowedRoles(requested []Role) []Role {
 	var out []Role
 	for _, r := range requested {
-		if r == RoleStorage || t.MayDecrypt() {
+		switch r {
+		case RoleStorage, RoleCompute:
 			out = append(out, r)
+		case RoleControl, RoleGateway:
+			if t == TierTrusted {
+				out = append(out, r)
+			}
 		}
 	}
 	return out
+}
+
+// Placement is a tenant's choice of which hosts may run an instance. It
+// trades the size of the compute pool against who could see guest RAM.
+type Placement string
+
+const (
+	// PlacementConfidential: only hosts whose CPU encrypts guest RAM.
+	PlacementConfidential Placement = "confidential"
+	// PlacementPrivate (default): the owner's PCs or confidential hosts;
+	// no stranger can read guest memory.
+	PlacementPrivate Placement = "private"
+	// PlacementAny: every compute host, including untrusted PCs. For
+	// workloads whose memory may be visible to the host owner.
+	PlacementAny Placement = "any"
+)
+
+// ParsePlacement parses a placement name; empty means PlacementPrivate.
+func ParsePlacement(s string) (Placement, error) {
+	switch p := Placement(s); p {
+	case "":
+		return PlacementPrivate, nil
+	case PlacementConfidential, PlacementPrivate, PlacementAny:
+		return p, nil
+	default:
+		return "", fmt.Errorf("unknown placement %q", s)
+	}
+}
+
+// Allows reports whether an instance with this placement may run on a host
+// of the given tier. Confidential placement needs hardware memory
+// encryption, which owner-trusted PCs only have if attested as such.
+func (p Placement) Allows(host Tier, hostConfidential bool) bool {
+	switch p {
+	case PlacementConfidential:
+		return hostConfidential
+	case PlacementPrivate:
+		return host == TierTrusted || host == TierConfidential || hostConfidential
+	case PlacementAny:
+		return true
+	}
+	return false
 }
 
 // Member is the control plane's record of a node.

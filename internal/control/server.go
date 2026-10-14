@@ -192,7 +192,7 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 // IssueToken creates a join token. trusted marks nodes joining with it as
-// owner-trusted; otherwise they join as storage-only.
+// owner-trusted; otherwise they join as untrusted.
 func (s *Server) IssueToken(trusted bool, ttl time.Duration, maxUses int) (string, error) {
 	if ttl <= 0 || ttl > maxTokenTTL {
 		return "", fmt.Errorf("control: token ttl must be between 1s and %s", maxTokenTTL)
@@ -260,8 +260,8 @@ func validateKeys(req cluster.JoinRequest) error {
 // admit must be called with s.mu held.
 func (s *Server) admit(req cluster.JoinRequest, rec *token.Record) (*cluster.JoinResponse, error) {
 	// Hardware memory encryption is only a claim until attestation (M2), so
-	// a stranger's PC is storage-only even if it reports SEV-SNP or TDX.
-	tier := cluster.TierStorageOnly
+	// a stranger's PC joins as untrusted even if it reports SEV-SNP or TDX.
+	tier := cluster.TierUntrusted
 	if rec.Trusted {
 		tier = cluster.TierTrusted
 	}

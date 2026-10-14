@@ -6,18 +6,32 @@ next to the code.
 
 ## Principle
 
-Storage and networking spread across many peers; compute runs only where data
-can be decrypted safely. Encrypted shards can live on any PC. Plaintext in RAM
-only lives on a PC the owner trusts, or one with attested AMD SEV-SNP or Intel
-TDX.
+Every PC, including strangers' PCs, offers the same storage and compute
+features. The one thing hardware decides is whether guest RAM is hidden from
+the host owner: that needs AMD SEV-SNP or Intel TDX. Storage shards are always
+ciphertext, so storage needs no trust at all.
 
 ## Trust tiers
 
-| Tier | Who | May do |
+| Tier | Who | Storage | Compute | Control plane, gateway |
+| --- | --- | --- | --- | --- |
+| `trusted` | joined with a `-trusted` token (your PCs) | yes | yes | yes |
+| `confidential` | stranger's PC with attested SEV-SNP/TDX (from M2) | yes | yes, RAM encrypted | no |
+| `untrusted` | any other stranger's PC | yes | yes, RAM visible to host | no |
+
+The control plane and gateways hold the CA key, key-service shares and every
+tenant's data keys, so they stay on owner-trusted PCs. That is infrastructure,
+not a user feature: tenants get every feature whichever PCs they use.
+
+## Placement
+
+Each instance has a placement (EC2 tag or launch option, from M2):
+
+| Placement | Runs on | Use for |
 | --- | --- | --- |
-| `confidential` | attested SEV-SNP/TDX host (from M2) | run any tenant's guests |
-| `trusted` | joined with a `-trusted` token (your PCs) | every role |
-| `storage-only` | everyone else, including strangers' PCs | store ciphertext, relay |
+| `confidential` | hosts with SEV-SNP/TDX only | secrets, regulated data |
+| `private` (default) | your PCs or confidential hosts | normal workloads |
+| `any` | every compute host, including untrusted | public builds, rendering, tests, anything not secret |
 
 Gossip is only trusted for liveness and current endpoints, because strangers
 hold the gossip key too. Tier, roles, keys and mesh addresses always come from
@@ -29,7 +43,7 @@ the control plane registry.
 | --- | --- | --- |
 | M0 Mesh and cluster | init/join, CA, WireGuard mesh, gossip, Raft core | 3 PCs talk over the mesh |
 | M1 S3 storage | chunk, encrypt, 4+2 erasure coding, key service, SigV4 gateway, repair | `aws s3 sync` survives 2 PCs lost |
-| M2 EC2 basics | microVMs, SEV-SNP/TDX attestation, trust-tier placement, volumes, AMIs | SSH into a launched VM |
+| M2 EC2 basics | microVMs, SEV-SNP/TDX attestation, placement (`confidential`/`private`/`any`), volumes, AMIs | SSH into a launched VM |
 | M3 VPC networking | VPCs, subnets, IPAM, VXLAN inside WireGuard, security groups | SGs enforced across PCs |
 | M4 Peer hardening | proof-of-storage audits, reputation and quotas, restart on host loss | VM restarts on a new PC |
 | M5 Scale out | cluster instances, live migration, NAT gateway, elastic IPs | one instance ID spans 4 PCs |

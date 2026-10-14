@@ -21,7 +21,7 @@ func TestSaveLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	cfg := Config{NodeID: "n-1", Tier: cluster.TierStorageOnly, MeshIP: "100.64.0.1", GossipKey: []byte("k")}
+	cfg := Config{NodeID: "n-1", Tier: cluster.TierUntrusted, MeshIP: "100.64.0.1", GossipKey: []byte("k")}
 	if err := Save(dir, cfg, keys, pki.CertPEM(der), pki.CertPEM(ca.Cert.Raw)); err != nil {
 		t.Fatal(err)
 	}

@@ -135,7 +135,7 @@ func cmdInit(args []string) error {
 func cmdToken(args []string) error {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
 	dir := fs.String("dir", defaultDir(), "state directory with admin.crt")
-	trusted := fs.Bool("trusted", false, "the PC is yours: allow it to hold plaintext and run guests")
+	trusted := fs.Bool("trusted", false, "the PC is yours: it may also run the control plane and gateways, and private instances")
 	ttl := fs.Duration("ttl", 24*time.Hour, "how long the token is valid")
 	uses := fs.Int("uses", 1, "how many PCs may join with it (0 = unlimited)")
 	fs.Parse(args)
@@ -209,8 +209,9 @@ func cmdJoin(args []string) error {
 	}
 	fmt.Printf("Joined cluster %q as %s at %s.\n", resp.Cluster, resp.NodeID, resp.MeshIP)
 	fmt.Printf("Tier: %s. Roles granted: %v.\n", resp.Tier, resp.Roles)
-	if resp.Tier == cluster.TierStorageOnly {
-		fmt.Println("This PC will store encrypted shards and relay traffic only; it never sees keys or plaintext.")
+	if resp.Tier == cluster.TierUntrusted {
+		fmt.Println("This PC stores encrypted shards and runs instances whose owners chose placement \"any\".")
+		fmt.Println("It never holds cluster keys. Without SEV-SNP/TDX its guests' RAM is not hidden from you.")
 	}
 	fmt.Printf("Start it with:  jyd -dir %s\n", *dir)
 	return nil

@@ -3,7 +3,8 @@
 A peer-to-peer cloud made of spare x64 PCs that the stock `aws` CLI can drive
 (`--endpoint-url`), starting with S3, EC2 and VPC networking. Storage, network
 traffic and guest RAM are encrypted; PCs contributed by strangers only ever hold
-ciphertext.
+ciphertext. Strangers' PCs get the same storage and compute features as your
+own; the only difference is encrypted guest RAM, which needs SEV-SNP or TDX.
 
 This repository is at **milestone M0: mesh and cluster bootstrap**. See
 [docs/design.md](docs/design.md) for the architecture and roadmap.
@@ -15,9 +16,11 @@ This repository is at **milestone M0: mesh and cluster bootstrap**. See
 - `jyctl token` issues a join token. Tokens pin the CA by fingerprint, are
   single-use and expire (24h by default). `-trusted` marks the PC as yours.
 - `jyctl join <token>` enrolls a PC. Without `-trusted` it joins as
-  **storage-only**: it can hold encrypted shards and relay traffic, but never
-  runs guests, gateways or the control plane, even if it claims SEV-SNP/TDX
-  (attestation arrives in M2).
+  **untrusted**: it stores encrypted shards and runs compute like any other
+  PC, but never holds cluster keys, so it can't run the control plane or a
+  gateway. Instances only land on it if their owner picks placement `any`,
+  because without memory encryption the host could read guest RAM. SEV-SNP/TDX
+  claims are ignored until attestation arrives in M2.
 - `jyd` runs on every PC: it serves the control plane API on the PC that ran
   `init`, gossips liveness over encrypted SWIM (hashicorp/memberlist), and keeps
   a WireGuard interface (`jy0`, `100.64.0.0/10`) in sync with every other node.
@@ -35,7 +38,7 @@ go build -o bin/ ./cmd/...
 # PC 1 (192.168.1.10)
 sudo bin/jyctl init -control 192.168.1.10:7443
 sudo bin/jyd &
-sudo bin/jyctl token            # a stranger's PC: storage-only
+sudo bin/jyctl token            # a stranger's PC: untrusted
 sudo bin/jyctl token -trusted   # one of your own PCs
 
 # PC 2

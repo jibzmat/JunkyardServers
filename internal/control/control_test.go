@@ -76,7 +76,7 @@ func (c *testCluster) token(t *testing.T, trusted bool) token.Token {
 	return tok
 }
 
-func TestStrangerJoinsStorageOnly(t *testing.T) {
+func TestStrangerJoinsUntrusted(t *testing.T) {
 	c := newTestCluster(t)
 	tok := c.token(t, false)
 	req, _ := joinReq(t, cluster.RoleCompute, cluster.RoleStorage, cluster.RoleControl)
@@ -84,11 +84,12 @@ func TestStrangerJoinsStorageOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Tier != cluster.TierStorageOnly {
-		t.Fatalf("tier = %s, want storage-only", resp.Tier)
+	if resp.Tier != cluster.TierUntrusted {
+		t.Fatalf("tier = %s, want untrusted", resp.Tier)
 	}
-	if len(resp.Roles) != 1 || resp.Roles[0] != cluster.RoleStorage {
-		t.Fatalf("roles = %v, want only storage", resp.Roles)
+	// Compute and storage are granted; the control plane is not.
+	if len(resp.Roles) != 2 || resp.Roles[0] != cluster.RoleCompute || resp.Roles[1] != cluster.RoleStorage {
+		t.Fatalf("roles = %v, want compute and storage", resp.Roles)
 	}
 	cert, err := pki.ParseCertPEM(resp.CertPEM)
 	if err != nil {
