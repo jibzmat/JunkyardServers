@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -28,6 +29,8 @@ type cluster struct {
 	mu      sync.Mutex
 	nodes   map[string]storage.Node
 	servers map[string]*httptest.Server
+	disks   map[string]*storage.ShardStore
+	dirs    map[string]string
 	store   *storage.Store
 	n       int
 }
@@ -37,7 +40,8 @@ func newCluster(t *testing.T, n int) *cluster {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &cluster{t: t, ca: ca, nodes: map[string]storage.Node{}, servers: map[string]*httptest.Server{}}
+	c := &cluster{t: t, ca: ca, nodes: map[string]storage.Node{}, servers: map[string]*httptest.Server{},
+		disks: map[string]*storage.ShardStore{}, dirs: map[string]string{}}
 	cert, key := c.issue(pki.KindControl, "repair")
 	c.store = &storage.Store{
 		Client: storage.NewShardClient(pki.TLSCertificate(cert.Raw, key, ca.Cert), ca.Cert),
@@ -70,7 +74,8 @@ func (c *cluster) issue(kind pki.Kind, name string) (*x509.Certificate, ed25519.
 func (c *cluster) add() string {
 	id := fmt.Sprintf("n-%d", c.n)
 	c.n++
-	st, err := storage.OpenShardStore(filepath.Join(c.t.TempDir(), "shards"))
+	dir := filepath.Join(c.t.TempDir(), "shards")
+	st, err := storage.OpenShardStore(dir)
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -84,6 +89,8 @@ func (c *cluster) add() string {
 	c.mu.Lock()
 	c.nodes[id] = storage.Node{ID: id, Addr: ts.Listener.Addr().String()}
 	c.servers[id] = ts
+	c.disks[id] = st
+	c.dirs[id] = dir
 	c.mu.Unlock()
 	return id
 }
@@ -240,5 +247,83 @@ func TestMoveShardsRejectsStaleObject(t *testing.T) {
 	}
 	if before.Layout.Chunks[0].Shards[0].Node == "n-9" {
 		t.Fatal("stored record was modified in place")
+	}
+}
+
+func TestCorruptShardIsScrubbedAndRebuilt(t *testing.T) {
+	c := newCluster(t, 3) // 2+1
+	srv := newControl(t)
+	data := []byte("some bytes worth keeping")
+	key, obj := put(t, c, srv, "k", data)
+	sh := obj.Layout.Chunks[0].Shards[0]
+
+	// Flip a byte on disk; the scrubber notices and drops the file.
+	files, _ := filepath.Glob(filepath.Join(c.dirs[sh.Node], "*", "*", sh.Hash))
+	if len(files) != 1 {
+		t.Fatalf("shard file not found: %v", files)
+	}
+	b, _ := os.ReadFile(files[0])
+	b[0] ^= 1
+	if err := os.WriteFile(files[0], b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checked, removed, err := c.disks[sh.Node].Scrub(context.Background(), 0)
+	if err != nil || checked == 0 || removed != 1 {
+		t.Fatalf("scrub: checked %d removed %d err %v", checked, removed, err)
+	}
+
+	// Repair puts it back on the same node; the layout is unchanged.
+	later := func() time.Time { return time.Now().Add(time.Hour) }
+	r := &Repairer{Meta: srv, Store: c.store, After: -1, Now: later, Logger: log.New(io.Discard, "", 0)}
+	st, err := r.Pass(context.Background())
+	if err != nil || st.Rebuilt != 1 || st.Collected != 0 {
+		t.Fatalf("%+v %v", st, err)
+	}
+	if _, err := c.disks[sh.Node].Get(sh.Hash); err != nil {
+		t.Fatalf("shard not restored: %v", err)
+	}
+	got := current(t, srv, "k")
+	if got.Layout.Chunks[0].Shards[0] != sh {
+		t.Fatalf("layout changed: %v", got.Layout.Chunks[0].Shards)
+	}
+	var out bytes.Buffer
+	if err := c.store.Get(context.Background(), got.ID, key, got.Layout, 0, -1, &out); err != nil || !bytes.Equal(out.Bytes(), data) {
+		t.Fatalf("read back: %v", err)
+	}
+}
+
+func TestUnreferencedShardsAreCollected(t *testing.T) {
+	c := newCluster(t, 3)
+	srv := newControl(t)
+	_, kept := put(t, c, srv, "kept", []byte("keep me"))
+	// Shards written but never recorded, as a failed upload leaves them.
+	ok, _ := storage.NewObjectKey()
+	orphan, _, err := c.store.Put(context.Background(), "orphan", ok, bytes.NewReader([]byte("lost upload")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiet := log.New(io.Discard, "", 0)
+
+	// Young orphans stay: their object may still be on its way.
+	r := &Repairer{Meta: srv, Store: c.store, After: -1, Logger: quiet}
+	if st, err := r.Pass(context.Background()); err != nil || st.Collected != 0 {
+		t.Fatalf("collected young shards: %+v %v", st, err)
+	}
+
+	r = &Repairer{Meta: srv, Store: c.store, After: -1, Logger: quiet,
+		Now: func() time.Time { return time.Now().Add(2 * DefaultGCGrace) }}
+	st, err := r.Pass(context.Background())
+	if err != nil || st.Collected != len(orphan.Chunks[0].Shards) || st.Rebuilt != 0 {
+		t.Fatalf("%+v %v (orphan has %d shards)", st, err, len(orphan.Chunks[0].Shards))
+	}
+	for _, sh := range orphan.Chunks[0].Shards {
+		if _, err := c.disks[sh.Node].Get(sh.Hash); err == nil {
+			t.Fatalf("orphan shard %s still on %s", sh.Hash, sh.Node)
+		}
+	}
+	for _, sh := range kept.Layout.Chunks[0].Shards {
+		if _, err := c.disks[sh.Node].Get(sh.Hash); err != nil {
+			t.Fatalf("referenced shard on %s deleted: %v", sh.Node, err)
+		}
 	}
 }

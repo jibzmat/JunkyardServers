@@ -385,6 +385,20 @@ func (s *Server) AllObjects() []s3meta.Object {
 	return out
 }
 
+// AllUploads returns the segments of every part of every unfinished
+// multipart upload, so garbage collection keeps their shards.
+func (s *Server) AllUploads() []s3meta.Segment {
+	var out []s3meta.Segment
+	s.fsm.view(func(st *state) {
+		for _, u := range st.Uploads {
+			for _, p := range u.Parts {
+				out = append(out, p.Segment)
+			}
+		}
+	})
+	return out
+}
+
 // MoveShards records shards that repair rebuilt on other nodes. It fails
 // if the object or segment changed since it was read.
 func (s *Server) MoveShards(bucket, key, segmentID string, moves []s3meta.ShardMove) error {

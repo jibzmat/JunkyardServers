@@ -1,7 +1,13 @@
 // Package repair rebuilds shards lost with storage nodes that are gone for
 // good. It runs on the control-plane leader and works on ciphertext only:
 // it fetches any k shards of a chunk, re-encodes the rest and writes the
-// missing ones to healthy nodes that hold no shard of that chunk yet.
+// missing ones to healthy nodes that hold no shard of that chunk yet. A
+// shard a live node has lost (bit rot found by its scrubber, a wiped disk)
+// is written back to the same node.
+//
+// Each pass also collects garbage: shards no object or upload refers to,
+// left behind by failed writes, deletes that missed a node, or nodes that
+// came back after repair moved their shards elsewhere.
 package repair
 
 import (
@@ -21,9 +27,16 @@ import (
 // heal on their own and shouldn't cost a full copy of everything.
 const DefaultAfter = 15 * time.Minute
 
+// DefaultGCGrace is how old an unreferenced shard must be before it is
+// deleted. Shards are written before the object that uses them is
+// recorded, so a young unreferenced shard may belong to an upload still in
+// flight.
+const DefaultGCGrace = 24 * time.Hour
+
 // Meta is what repair needs from the control plane.
 type Meta interface {
 	AllObjects() []s3meta.Object
+	AllUploads() []s3meta.Segment
 	MoveShards(bucket, key, segmentID string, moves []s3meta.ShardMove) error
 }
 
@@ -34,9 +47,12 @@ type Repairer struct {
 	Store *storage.Store
 	// After is how long a node must be gone before repair; 0 means
 	// DefaultAfter. Tests use a negative value for "immediately".
-	After  time.Duration
-	Logger *log.Logger
-	Now    func() time.Time
+	After time.Duration
+	// GCGrace is the minimum age of a shard garbage collection may delete;
+	// 0 means DefaultGCGrace.
+	GCGrace time.Duration
+	Logger  *log.Logger
+	Now     func() time.Time
 
 	mu       sync.Mutex
 	started  time.Time
@@ -49,6 +65,8 @@ type Stats struct {
 	Rebuilt int // shards written to new nodes
 	Lost    int // chunks with fewer than k shards anywhere
 	Failed  int // chunks that needed repair but could not get it
+
+	Collected int // unreferenced shards deleted
 }
 
 func (r *Repairer) now() time.Time {
@@ -63,6 +81,13 @@ func (r *Repairer) after() time.Duration {
 		return DefaultAfter
 	}
 	return r.After
+}
+
+func (r *Repairer) gcGrace() time.Duration {
+	if r.GCGrace == 0 {
+		return DefaultGCGrace
+	}
+	return r.GCGrace
 }
 
 func (r *Repairer) logf(format string, args ...any) {
@@ -93,6 +118,9 @@ func (r *Repairer) Run(ctx context.Context, interval time.Duration, leader func(
 		}
 		if st.Rebuilt > 0 || st.Lost > 0 || st.Failed > 0 {
 			r.logf("repair: rebuilt %d shards; %d chunks still need repair, %d lost", st.Rebuilt, st.Failed, st.Lost)
+		}
+		if st.Collected > 0 {
+			r.logf("repair: deleted %d unreferenced shards", st.Collected)
 		}
 	}
 }
@@ -131,37 +159,133 @@ func (r *Repairer) gone(id string) bool {
 	return r.now().Sub(seen) > r.after()
 }
 
+// inventory is what each live node reported holding, by node ID. A node
+// whose listing failed has no entry; its shards are assumed present.
+type inventory map[string]map[string]time.Time
+
+// has reports whether node holds hash, as far as is known.
+func (inv inventory) has(node, hash string) bool {
+	held, ok := inv[node]
+	if !ok {
+		return true
+	}
+	_, ok = held[hash]
+	return ok
+}
+
 func (r *Repairer) pass(ctx context.Context, alive map[string]storage.Node) (Stats, error) {
 	var st Stats
 	ids := make([]string, 0, len(alive))
 	for id := range alive {
 		ids = append(ids, id)
 	}
-	for _, obj := range r.Meta.AllObjects() {
+	// List before reading metadata: a shard recorded after this read was
+	// written or refreshed after the listing, so it is never mistaken for
+	// old garbage.
+	listed := r.now()
+	inv := r.inventory(ctx, alive)
+	objects := r.Meta.AllObjects()
+	uploads := r.Meta.AllUploads()
+	for _, obj := range objects {
+		// Shards of an object written while the nodes were being listed
+		// may be missing from the lists; don't treat them as lost.
+		check := inv
+		if !obj.Modified.Before(listed.Add(-time.Minute)) {
+			check = nil
+		}
 		for _, seg := range obj.Segments() {
 			if err := ctx.Err(); err != nil {
 				return st, err
 			}
-			r.segment(ctx, obj, seg, alive, ids, &st)
+			r.segment(ctx, obj, seg, alive, ids, check, &st)
 		}
 	}
-	return st, nil
+	st.Collected = r.collect(ctx, alive, inv, objects, uploads)
+	return st, ctx.Err()
+}
+
+func (r *Repairer) inventory(ctx context.Context, alive map[string]storage.Node) inventory {
+	inv := inventory{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, n := range alive {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			held, err := r.Store.Client.List(ctx, n)
+			if err != nil {
+				if ctx.Err() == nil {
+					r.logf("repair: listing shards on %s: %v", n.ID, err)
+				}
+				return
+			}
+			mu.Lock()
+			inv[n.ID] = held
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return inv
+}
+
+// collect deletes shards that nothing refers to and that are older than
+// the grace period.
+func (r *Repairer) collect(ctx context.Context, alive map[string]storage.Node, inv inventory, objects []s3meta.Object, uploads []s3meta.Segment) int {
+	used := map[string]map[string]bool{}
+	note := func(seg s3meta.Segment) {
+		for _, c := range seg.Layout.Chunks {
+			for _, sh := range c.Shards {
+				if used[sh.Node] == nil {
+					used[sh.Node] = map[string]bool{}
+				}
+				used[sh.Node][sh.Hash] = true
+			}
+		}
+	}
+	for _, obj := range objects {
+		for _, seg := range obj.Segments() {
+			note(seg)
+		}
+	}
+	for _, seg := range uploads {
+		note(seg)
+	}
+	cutoff := r.now().Add(-r.gcGrace())
+	n := 0
+	for id, held := range inv {
+		for hash, mod := range held {
+			if ctx.Err() != nil {
+				return n
+			}
+			if used[id][hash] || mod.After(cutoff) {
+				continue
+			}
+			if err := r.Store.Client.Delete(ctx, alive[id], hash); err == nil {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // segment repairs one segment's chunks and records the moves in one write.
-func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Segment, alive map[string]storage.Node, ids []string, st *Stats) {
+func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Segment, alive map[string]storage.Node, ids []string, inv inventory, st *Stats) {
 	l := seg.Layout
 	total := l.DataShards + l.ParityShards
 	var moves []s3meta.ShardMove
+	restoredAll := 0
 	var written []storage.ShardRef
 	for ci, c := range l.Chunks {
 		st.Chunks++
 		healthy := map[int]bool{}
 		holders := map[string]bool{}
+		lost := map[int]storage.Node{} // shards a live node no longer has
 		waiting := false
 		for _, sh := range c.Shards {
 			holders[sh.Node] = true
 			switch {
+			case alive[sh.Node].ID != "" && !inv.has(sh.Node, sh.Hash):
+				lost[sh.Index] = alive[sh.Node]
 			case alive[sh.Node].ID != "":
 				healthy[sh.Index] = true
 			case !r.gone(sh.Node):
@@ -180,6 +304,7 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 			st.Failed++
 			continue
 		}
+		restored := 0
 		ranked := storage.Place(seg.ID+"/"+strconv.Itoa(ci), ids, len(ids))
 		next := 0
 		for idx := 0; idx < total; idx++ {
@@ -189,6 +314,13 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 			hash := storage.ShardHash(shards[idx])
 			if want := recorded(c, idx); want != "" && want != hash {
 				r.logf("repair: %s/%s chunk %d shard %d rebuilt with a different hash; skipping", obj.Bucket, obj.Key, ci, idx)
+				continue
+			}
+			if n, ok := lost[idx]; ok {
+				// Its node is alive: put it back where the layout says.
+				if err := r.Store.Client.Put(ctx, n, hash, shards[idx]); err == nil {
+					restored++
+				}
 				continue
 			}
 			for next < len(ranked) {
@@ -206,10 +338,12 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 				break
 			}
 		}
-		if len(healthy)+countChunk(moves, ci) < total {
+		restoredAll += restored
+		if len(healthy)+restored+countChunk(moves, ci) < total {
 			st.Failed++ // not enough distinct nodes; try again next pass
 		}
 	}
+	st.Rebuilt += restoredAll
 	if len(moves) == 0 {
 		return
 	}

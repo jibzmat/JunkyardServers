@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // MaxShardSize bounds what a storage node accepts: one whole sealed chunk
@@ -44,7 +47,10 @@ func (s *ShardStore) Put(hash string, data []byte) error {
 	}
 	p := s.path(hash)
 	if _, err := os.Stat(p); err == nil {
-		return nil
+		// Refresh the time so garbage collection treats it as new: repair
+		// may be re-adding a shard that was left here earlier.
+		now := time.Now()
+		return os.Chtimes(p, now, now)
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
@@ -87,9 +93,55 @@ func (s *ShardStore) Get(hash string) ([]byte, error) {
 		return nil, err
 	}
 	if ShardHash(data) != hash {
+		// Bit rot: drop it so the shard shows as missing and gets rebuilt.
+		os.Remove(s.path(hash))
 		return nil, errHashMismatch
 	}
 	return data, nil
+}
+
+// Walk calls fn for every stored shard with its modification time.
+func (s *ShardStore) Walk(fn func(hash string, mod time.Time) error) error {
+	return filepath.WalkDir(s.dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil // removed while walking
+			}
+			return err
+		}
+		if d.IsDir() || !ValidHash(d.Name()) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		return fn(d.Name(), info.ModTime())
+	})
+}
+
+// Scrub re-reads every shard and removes those whose content no longer
+// matches their hash, pausing between shards to spare the disk. It returns
+// how many shards it checked and removed.
+func (s *ShardStore) Scrub(ctx context.Context, pause time.Duration) (checked, removed int, err error) {
+	err = s.Walk(func(hash string, _ time.Time) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		checked++
+		if _, err := s.Get(hash); errors.Is(err, errHashMismatch) {
+			removed++
+		}
+		if pause > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(pause):
+			}
+		}
+		return nil
+	})
+	return checked, removed, err
 }
 
 // Delete removes a shard; deleting a missing shard is not an error.

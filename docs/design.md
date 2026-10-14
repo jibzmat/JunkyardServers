@@ -69,6 +69,15 @@ the control plane registry.
   holding no shard of that chunk, and records the moves in one Raft write
   per segment. The write is refused if the object changed meanwhile, and the
   new shards are then deleted.
+- Scrubbing: each storage node re-reads every shard daily (and on every
+  read) and deletes any whose hash no longer matches. The leader lists each
+  live node's shards on every repair pass, so a shard a live node lost is
+  rebuilt and written back to that node.
+- Garbage collection: the same pass deletes shards no object or unfinished
+  upload refers to, once they are 24 hours old. Shards are written before
+  their object is recorded, so younger ones may belong to an upload in
+  flight. Nodes are listed before metadata is read, so a shard recorded
+  after the read is never older than the listing says.
 
 ## Roadmap
 

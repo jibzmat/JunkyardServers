@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
 	"log"
@@ -54,7 +55,24 @@ func startStorage(dir string, n *node.Node, a *agent.Agent, logger *log.Logger) 
 			logger.Fatalf("storage: %v", err)
 		}
 	}()
+	go scrub(st, logger)
 	return srv, nil
+}
+
+// scrub re-reads every local shard once a day and drops any that rotted;
+// the control leader's repair pass then rebuilds them from other nodes.
+func scrub(st *storage.ShardStore, logger *log.Logger) {
+	time.Sleep(10 * time.Minute) // let the node settle after a restart
+	for {
+		checked, removed, err := st.Scrub(context.Background(), 20*time.Millisecond)
+		switch {
+		case err != nil:
+			logger.Printf("storage: scrub: %v", err)
+		case removed > 0:
+			logger.Printf("storage: scrub checked %d shards and removed %d corrupt ones", checked, removed)
+		}
+		time.Sleep(24 * time.Hour)
+	}
 }
 
 // startGateway serves the S3 API.

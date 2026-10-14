@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -10,6 +11,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +39,7 @@ func (s *ShardServer) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/shards/{hash}", s.authed(s.put))
 	mux.HandleFunc("GET /v1/shards/{hash}", s.authed(s.get))
 	mux.HandleFunc("DELETE /v1/shards/{hash}", s.authed(s.del))
+	mux.HandleFunc("GET /v1/shards", s.authed(s.list))
 	return mux
 }
 
@@ -101,6 +105,21 @@ func (s *ShardServer) get(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = w.Write(data)
+}
+
+// list streams "hash unix-seconds" lines, one per stored shard. Hashes of
+// ciphertext reveal nothing, so any cluster certificate may list.
+func (s *ShardServer) list(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	bw := bufio.NewWriter(w)
+	err := s.Store.Walk(func(hash string, mod time.Time) error {
+		_, err := fmt.Fprintf(bw, "%s %d\n", hash, mod.Unix())
+		return err
+	})
+	if err == nil {
+		bw.WriteString("end\n") // lets the client tell a full list from a cut one
+	}
+	bw.Flush()
 }
 
 func (s *ShardServer) del(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +221,42 @@ func (c *ShardClient) Get(ctx context.Context, n Node, hash string) ([]byte, err
 		return nil, errHashMismatch
 	}
 	return data, nil
+}
+
+// List returns every shard node n holds, with its modification time.
+func (c *ShardClient) List(ctx context.Context, n Node) (map[string]time.Time, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+n.Addr+"/v1/shards", nil)
+	if err != nil {
+		return nil, err
+	}
+	hc := *c.client(n)
+	hc.Timeout = 10 * time.Minute // large stores take a while to walk
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("storage: list shards on %s: HTTP %d", n.ID, resp.StatusCode)
+	}
+	out := map[string]time.Time{}
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "end" {
+			return out, nil
+		}
+		hash, ts, ok := strings.Cut(line, " ")
+		secs, err := strconv.ParseInt(ts, 10, 64)
+		if !ok || err != nil || !ValidHash(hash) {
+			return nil, fmt.Errorf("storage: bad shard list line from %s", n.ID)
+		}
+		out[hash] = time.Unix(secs, 0)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("storage: shard list from %s was cut short", n.ID)
 }
 
 // Delete removes a shard from node n.

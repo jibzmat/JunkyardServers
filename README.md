@@ -67,6 +67,9 @@ architecture and roadmap.
   unreachable for 15 minutes (`jyd -repair-after`), every chunk it held is
   rebuilt from any k surviving shards and the missing shards are written to
   other PCs. Repair works on ciphertext and needs no keys.
+- Storage PCs re-read every shard daily and drop any that rotted; the next
+  repair pass writes it back. Shards nothing refers to (a failed upload, a
+  PC that returns after repair moved its shards) are deleted after 24 hours.
 - A chunk is written once k+1 of its shards are stored, so one more PC can
   fail before it is at risk. Reads need any k shards. A PC that fails a write
   is skipped for 30 seconds, so uploads keep working while gossip catches up.
@@ -143,9 +146,6 @@ go vet ./... && go test -race ./...
 
 M1:
 
-- Scrubbing and garbage collection: shards are not yet re-read to catch
-  silent corruption, and shards left on a PC that comes back after repair
-  are not cleaned up.
 - Objects written while PCs were down keep the thinner coding that fit the
   PCs left; repair restores missing shards but doesn't upgrade the coding.
 - The gateway-side encrypted listing index for large buckets. Listing works
