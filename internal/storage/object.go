@@ -1,0 +1,284 @@
+package storage
+
+import (
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"sync"
+)
+
+// Node is a storage node shards can be placed on.
+type Node struct {
+	ID   string
+	Addr string // shard server host:port
+}
+
+// ShardRef says where one shard of a chunk lives.
+type ShardRef struct {
+	Index int    `json:"i"` // position in the k+m shard set
+	Hash  string `json:"h"`
+	Node  string `json:"n"` // node ID
+}
+
+// ChunkRef describes one stored chunk.
+type ChunkRef struct {
+	Size       int        `json:"size"`   // plaintext bytes
+	SealedSize int        `json:"sealed"` // ciphertext bytes before coding
+	Shards     []ShardRef `json:"shards"`
+}
+
+// Layout records how an object was coded.
+type Layout struct {
+	DataShards   int        `json:"k"`
+	ParityShards int        `json:"m"`
+	Chunks       []ChunkRef `json:"chunks"`
+}
+
+// Size is the object's plaintext size.
+func (l Layout) Size() int64 {
+	var n int64
+	for _, c := range l.Chunks {
+		n += int64(c.Size)
+	}
+	return n
+}
+
+// Store reads and writes objects as shards on storage nodes. The coding for
+// each new object is chosen from the number of storage nodes (ChooseCoding)
+// and recorded in its layout.
+type Store struct {
+	Client *ShardClient
+	// Nodes returns the storage nodes currently usable for placement and
+	// the address of every known node (for reading shards placed earlier).
+	Nodes func() []Node
+}
+
+// ErrNotEnoughNodes means fewer than k+1 storage nodes accepted a chunk.
+var ErrNotEnoughNodes = errors.New("storage: not enough storage nodes reachable")
+
+// Put reads r to the end, storing it as objectID under key. It returns the
+// layout to record in metadata and the MD5 of the plaintext (the S3 ETag).
+// A chunk counts as stored once k+1 of its k+m shards are on distinct nodes,
+// so one more node can fail before the chunk is at risk; repair restores the
+// rest later.
+func (s *Store) Put(ctx context.Context, objectID string, key ObjectKey, r io.Reader) (Layout, string, error) {
+	nodes := s.Nodes()
+	if len(nodes) == 0 {
+		return Layout{}, "", ErrNotEnoughNodes
+	}
+	k, m := ChooseCoding(len(nodes))
+	layout := Layout{DataShards: k, ParityShards: m}
+	sum := md5.New()
+	buf := make([]byte, ChunkSize)
+	for idx := uint64(0); ; idx++ {
+		n, err := io.ReadFull(r, buf)
+		if err == io.EOF && idx > 0 {
+			break
+		}
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return Layout{}, "", err
+		}
+		plain := buf[:n]
+		sum.Write(plain)
+		ref, perr := s.putChunk(ctx, objectID, key, idx, plain, k, m, nodes)
+		if perr != nil {
+			s.cleanup(context.WithoutCancel(ctx), layout)
+			return Layout{}, "", perr
+		}
+		layout.Chunks = append(layout.Chunks, ref)
+		if n < ChunkSize {
+			break
+		}
+	}
+	return layout, hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+func (s *Store) putChunk(ctx context.Context, objectID string, key ObjectKey, idx uint64, plain []byte, k, m int, nodes []Node) (ChunkRef, error) {
+	sealed, err := SealChunk(key, objectID, idx, plain)
+	if err != nil {
+		return ChunkRef{}, err
+	}
+	shards, err := Encode(sealed, k, m)
+	if err != nil {
+		return ChunkRef{}, err
+	}
+	byID := map[string]Node{}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		byID[n.ID] = n
+		ids = append(ids, n.ID)
+	}
+	// Rank every node for this chunk; shard i goes to the i-th ranked node,
+	// and falls through to later ones if that node fails.
+	ranked := Place(objectID+"/"+strconv.FormatUint(idx, 10), ids, len(ids))
+
+	type result struct {
+		ref ShardRef
+		ok  bool
+	}
+	results := make([]result, len(shards))
+	var mu sync.Mutex
+	used := map[string]bool{}
+	next := 0
+	claim := func() (Node, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		for next < len(ranked) {
+			id := ranked[next]
+			next++
+			if !used[id] {
+				used[id] = true
+				return byID[id], true
+			}
+		}
+		return Node{}, false
+	}
+	var wg sync.WaitGroup
+	for i, shard := range shards {
+		wg.Add(1)
+		go func(i int, shard []byte) {
+			defer wg.Done()
+			hash := ShardHash(shard)
+			for {
+				node, ok := claim()
+				if !ok {
+					return
+				}
+				if err := s.Client.Put(ctx, node.Addr, hash, shard); err == nil {
+					results[i] = result{ShardRef{Index: i, Hash: hash, Node: node.ID}, true}
+					return
+				}
+			}
+		}(i, shard)
+	}
+	wg.Wait()
+
+	ref := ChunkRef{Size: len(plain), SealedSize: len(sealed)}
+	for _, r := range results {
+		if r.ok {
+			ref.Shards = append(ref.Shards, r.ref)
+		}
+	}
+	if need := min(k+1, k+m); len(ref.Shards) < need {
+		s.cleanup(context.WithoutCancel(ctx), Layout{Chunks: []ChunkRef{ref}})
+		return ChunkRef{}, fmt.Errorf("%w: %d of %d shards stored", ErrNotEnoughNodes, len(ref.Shards), k+m)
+	}
+	return ref, nil
+}
+
+// Get writes length bytes of the object starting at offset to w. A negative
+// length means to the end.
+func (s *Store) Get(ctx context.Context, objectID string, key ObjectKey, layout Layout, offset, length int64, w io.Writer) error {
+	size := layout.Size()
+	if offset < 0 || offset > size {
+		return fmt.Errorf("storage: offset %d out of range", offset)
+	}
+	if length < 0 || offset+length > size {
+		length = size - offset
+	}
+	addrs := s.addrs()
+	var pos int64
+	for idx, c := range layout.Chunks {
+		start, end := pos, pos+int64(c.Size)
+		pos = end
+		if length == 0 || end <= offset {
+			continue
+		}
+		if start >= offset+length {
+			break
+		}
+		plain, err := s.getChunk(ctx, objectID, key, layout, uint64(idx), c, addrs)
+		if err != nil {
+			return err
+		}
+		from := max(offset-start, 0)
+		to := min(offset+length-start, int64(c.Size))
+		if _, err := w.Write(plain[from:to]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) addrs() map[string]string {
+	out := map[string]string{}
+	for _, n := range s.Nodes() {
+		out[n.ID] = n.Addr
+	}
+	return out
+}
+
+// getChunk fetches shards in parallel and decodes as soon as k have arrived.
+func (s *Store) getChunk(ctx context.Context, objectID string, key ObjectKey, layout Layout, idx uint64, c ChunkRef, addrs map[string]string) ([]byte, error) {
+	k, m := layout.DataShards, layout.ParityShards
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type got struct {
+		i    int
+		data []byte
+	}
+	ch := make(chan got, len(c.Shards))
+	for _, sh := range c.Shards {
+		go func(sh ShardRef) {
+			addr, ok := addrs[sh.Node]
+			if !ok {
+				ch <- got{sh.Index, nil}
+				return
+			}
+			data, err := s.Client.Get(ctx, addr, sh.Hash)
+			if err != nil {
+				data = nil
+			}
+			ch <- got{sh.Index, data}
+		}(sh)
+	}
+	shards := make([][]byte, k+m)
+	have := 0
+	for range c.Shards {
+		g := <-ch
+		if g.data != nil && g.i >= 0 && g.i < k+m {
+			shards[g.i] = g.data
+			have++
+			if have == k {
+				break
+			}
+		}
+	}
+	if have < k {
+		return nil, fmt.Errorf("storage: chunk %d: only %d of %d needed shards reachable", idx, have, k)
+	}
+	sealed, err := Decode(shards, k, m, c.SealedSize)
+	if err != nil {
+		return nil, err
+	}
+	return OpenChunk(key, objectID, idx, sealed)
+}
+
+// Delete removes an object's shards. Unreachable nodes keep orphaned
+// shards, which garbage collection (with repair) removes later.
+func (s *Store) Delete(ctx context.Context, layout Layout) {
+	s.cleanup(ctx, layout)
+}
+
+func (s *Store) cleanup(ctx context.Context, layout Layout) {
+	addrs := s.addrs()
+	var wg sync.WaitGroup
+	for _, c := range layout.Chunks {
+		for _, sh := range c.Shards {
+			addr, ok := addrs[sh.Node]
+			if !ok {
+				continue
+			}
+			wg.Add(1)
+			go func(addr, hash string) {
+				defer wg.Done()
+				_ = s.Client.Delete(ctx, addr, hash)
+			}(addr, sh.Hash)
+		}
+	}
+	wg.Wait()
+}
