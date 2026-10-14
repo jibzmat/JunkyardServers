@@ -8,11 +8,14 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +33,7 @@ func main() {
 	iface := flag.String("interface", "jy0", "mesh interface name")
 	verbose := flag.Bool("v", false, "log Raft internals")
 	emulate := flag.Bool("emulate", false, "run instances under QEMU's emulator on PCs without KVM (slow; for trying things out)")
+	storageQuota := flag.String("storage-quota", "", "most shard data this PC stores, e.g. 500G (default: none, but 10% of the disk, up to 20 GiB, is always left free)")
 	replicaPort := flag.Int("replica-port", 7446, "port compute PCs exchange disk copies on (the same on every PC)")
 	repairAfter := flag.Duration("repair-after", repair.DefaultAfter, "rebuild a storage node's shards elsewhere after it has been unreachable this long")
 	flag.Parse()
@@ -69,7 +73,11 @@ func main() {
 
 	a := agent.New(n, agent.Options{WireGuard: *wg, Interface: *iface, Logger: logger})
 	if hasRole(n.Config.Roles, cluster.RoleStorage) && n.Config.StoragePort != 0 {
-		srv, err := startStorage(*dir, n, a, logger)
+		quota, err := parseSize(*storageQuota)
+		if err != nil {
+			logger.Fatalf("-storage-quota: %v", err)
+		}
+		srv, err := startStorage(*dir, n, a, quota, logger)
 		if err != nil {
 			logger.Fatalf("storage: %v", err)
 		}
@@ -139,4 +147,33 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseSize reads a byte count with an optional K, M, G or T suffix
+// (powers of 1024). Empty means 0.
+func parseSize(s string) (int64, error) {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "B"), "I")
+	if s == "" {
+		return 0, nil
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'K':
+		mult = 1 << 10
+	case 'M':
+		mult = 1 << 20
+	case 'G':
+		mult = 1 << 30
+	case 'T':
+		mult = 1 << 40
+	}
+	if mult > 1 {
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("bad size %q", s)
+	}
+	return int64(n * float64(mult)), nil
 }

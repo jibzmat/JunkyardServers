@@ -141,6 +141,22 @@ type Member struct {
 	StoragePort int     `json:"storage_port,omitempty"`
 	Hardware    hw.Info `json:"hardware"`
 	JoinedAt    string  `json:"joined_at"`
+
+	// Reputation from storage audits (see control's audit.go).
+	Audits AuditRecord `json:"audits,omitempty"`
+}
+
+// AuditRecord is a storage node's audit history and standing.
+type AuditRecord struct {
+	Passed int `json:"passed,omitempty"`
+	Failed int `json:"failed,omitempty"`
+	// Score is 0 to 1: it rises a little with each audit passed and halves
+	// with each one failed.
+	Score    float64 `json:"score,omitempty"`
+	LastFail string  `json:"last_fail,omitempty"` // RFC 3339
+	// Suspended nodes get no new shards or instances, and their shards
+	// are rebuilt elsewhere, until their score recovers.
+	Suspended bool `json:"suspended,omitempty"`
 }
 
 // Has reports whether the member holds a role.

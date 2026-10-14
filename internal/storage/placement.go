@@ -38,3 +38,32 @@ func Place(chunkID string, nodes []string, n int) []string {
 	}
 	return out
 }
+
+// Rank orders nodes for a chunk: up to k of the owner's trusted PCs first,
+// then everyone else, each group by rendezvous hash. Shards are written in
+// rank order, so with k trusted PCs every chunk can still be decoded if all
+// strangers' PCs vanish at once. Suspended nodes are left out.
+func Rank(chunkID string, nodes []Node, k int) []string {
+	var trusted, all []string
+	for _, n := range nodes {
+		if n.Suspended {
+			continue
+		}
+		all = append(all, n.ID)
+		if n.Trusted {
+			trusted = append(trusted, n.ID)
+		}
+	}
+	first := Place(chunkID, trusted, max(k, 0))
+	out := append([]string(nil), first...)
+	taken := map[string]bool{}
+	for _, id := range first {
+		taken[id] = true
+	}
+	for _, id := range Place(chunkID, all, len(all)) {
+		if !taken[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}

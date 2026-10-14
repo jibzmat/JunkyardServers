@@ -7,8 +7,8 @@ ciphertext. Strangers' PCs get the same storage and compute features as your
 own; the only difference is encrypted guest RAM, which needs SEV-SNP or TDX.
 
 This repository has finished **M0 (mesh and cluster bootstrap)**, **M1
-(encrypted S3 storage)** and **M3 (VPC networking)**, and has **M2 (EC2)**
-except SEV-SNP/TDX attestation: the stock
+(encrypted S3 storage)**, **M3 (VPC networking)** and **M4 (peer
+hardening)**, and has **M2 (EC2)** except SEV-SNP/TDX attestation: the stock
 `aws s3`, `aws s3api` and `aws ec2` commands work against it. See [docs/design.md](docs/design.md) for the
 architecture and roadmap.
 
@@ -168,7 +168,7 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   (`sudo ip netns list` shows them). A tunnel through the gateway and
   public IPs come with M5.
 
-## What M4 adds so far: restart on host loss
+## What M4 adds: peer hardening
 
 - Every instance's disks (root and attached volumes) are mirrored live to
   a second compute PC its placement allows. A write finishes in the guest
@@ -179,6 +179,15 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
 - Compute PCs exchange disk copies on TCP port 7446 (`jyd -replica-port`,
   the same on every PC), over mutual TLS inside the mesh. They need
   `qemu-nbd`.
+- Proof of storage: every storage PC is asked for a random shard it should
+  hold every 10 minutes and must send it back intact. PCs that keep
+  failing are suspended (no new data or instances, their shards rebuilt
+  elsewhere) until passing audits restore their score. `jyctl members`
+  shows each PC's audits.
+- Quotas: `jyd -storage-quota 500G` caps what a PC stores, and every PC
+  keeps 10% of its disk (up to 20 GiB) free. New shards go to your own
+  PCs first, so with enough of them every chunk can be read even if all
+  strangers' PCs disappear at once.
 
 ## Try it
 
@@ -232,7 +241,7 @@ internal/s3gw/        S3 and EC2 gateway: SigV4/SigV2, buckets, objects, multipa
 internal/ec2meta/     EC2 records (instances, key pairs, images, volumes, snapshots)
 internal/compute/     compute host: QEMU driver, volumes, snapshots, cloud-init seed, metadata
 internal/vnet/        VPC namespaces, VXLAN, routing, NAT and security group rules on a PC
-internal/repair/      rebuilds shards lost with storage PCs
+internal/repair/      rebuilds shards lost with storage PCs, audits storage PCs
 internal/shamir/      Shamir secret sharing
 internal/cluster/     shared types: roles, trust tiers
 internal/hw/          hardware detection
@@ -257,7 +266,10 @@ M2:
 
 M4:
 
-- Proof-of-storage audits and reputation and quotas for strangers' PCs.
+- Chunks stored before you had enough trusted PCs aren't rebalanced onto
+  them later.
+- Suspension is the only consequence of failing audits; nothing yet
+  limits how many strangers' PCs one person can join (Sybil resistance).
 - After any interruption a mirror copies the whole disk again (no
   incremental resync yet), and the copy is out of step meanwhile.
 

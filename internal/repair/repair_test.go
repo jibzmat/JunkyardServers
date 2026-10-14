@@ -10,9 +10,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +33,7 @@ type cluster struct {
 	servers map[string]*httptest.Server
 	disks   map[string]*storage.ShardStore
 	dirs    map[string]string
+	liars   map[string]bool // claim shards in listings but never send them
 	store   *storage.Store
 	n       int
 }
@@ -82,7 +85,17 @@ func (c *cluster) add() string {
 	cert, key := c.issue(pki.KindNode, id)
 	ss := &storage.ShardServer{Store: st, Cert: pki.TLSCertificate(cert.Raw, key, c.ca.Cert), CA: c.ca.Cert,
 		MayDelete: func(x *x509.Certificate) bool { return pki.KindOf(x) == pki.KindControl }}
-	ts := httptest.NewUnstartedServer(ss.Handler())
+	h := ss.Handler()
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		liar := c.liars[id]
+		c.mu.Unlock()
+		if liar && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/shards/") {
+			http.NotFound(w, r)
+			return
+		}
+		h.ServeHTTP(w, r)
+	}))
 	ts.TLS = ss.TLSConfig()
 	ts.StartTLS()
 	c.t.Cleanup(ts.Close)
@@ -365,5 +378,65 @@ func TestThinCodingIsUpgraded(t *testing.T) {
 	}
 	if st, _ := r.Pass(context.Background()); st.Upgraded != 0 {
 		t.Fatalf("upgraded twice: %+v", st)
+	}
+}
+
+func TestAuditsCatchANodeThatDropsShards(t *testing.T) {
+	c := newCluster(t, 3) // 2+1
+	srv := newControl(t)
+	_, obj := put(t, c, srv, "k", []byte("hello"))
+	liar := obj.Layout.Chunks[0].Shards[0].Node
+	// It deletes its shards but keeps listing them.
+	c.mu.Lock()
+	c.liars = map[string]bool{liar: true}
+	c.mu.Unlock()
+
+	var logs bytes.Buffer
+	r := &Repairer{Meta: srv, Store: c.store, After: -1, Logger: log.New(&logs, "", 0)}
+	st, err := r.Pass(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), liar+" failed an audit") {
+		t.Fatalf("audit missed the liar: %q", logs.String())
+	}
+	if st.Rebuilt != 1 {
+		t.Fatalf("the shard was not rebuilt: %+v", st)
+	}
+	// Honest nodes pass.
+	for id := range c.nodes {
+		if id != liar && strings.Contains(logs.String(), id+" failed") {
+			t.Fatalf("%s failed: %q", id, logs.String())
+		}
+	}
+	// Audits wait AuditEvery before asking the node again.
+	logs.Reset()
+	if _, err := r.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "failed an audit") {
+		t.Fatalf("audited again at once: %q", logs.String())
+	}
+}
+
+func TestRepairMovesShardsOffSuspendedNodes(t *testing.T) {
+	c := newCluster(t, 4) // 3+1
+	srv := newControl(t)
+	_, obj := put(t, c, srv, "k", []byte("hello"))
+	bad := obj.Layout.Chunks[0].Shards[0].Node
+	c.add() // somewhere to move it
+	c.mu.Lock()
+	n := c.nodes[bad]
+	n.Suspended = true
+	c.nodes[bad] = n
+	c.mu.Unlock()
+	r := &Repairer{Meta: srv, Store: c.store, After: -1, AuditEvery: -1, Logger: log.New(io.Discard, "", 0)}
+	if st, err := r.Pass(context.Background()); err != nil || st.Rebuilt != 1 {
+		t.Fatalf("%+v %v", st, err)
+	}
+	for _, sh := range current(t, srv, "k").Layout.Chunks[0].Shards {
+		if sh.Node == bad {
+			t.Fatalf("shard still on the suspended node: %+v", sh)
+		}
 	}
 }

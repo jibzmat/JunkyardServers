@@ -86,7 +86,10 @@ func (s *ShardServer) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "shard too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if err := s.Store.Put(r.PathValue("hash"), data); err != nil {
+	if err := s.Store.Put(r.PathValue("hash"), data); errors.Is(err, ErrFull) {
+		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+		return
+	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

@@ -21,6 +21,19 @@ type Node struct {
 	// Name is what the node's certificate must name (its mesh IP). Empty
 	// means the host part of Addr.
 	Name string
+	// Trusted is one of the owner's own PCs (not a stranger's).
+	Trusted bool
+	// Suspended nodes failed too many audits: they get no new shards and
+	// repair moves their shards elsewhere.
+	Suspended bool
+}
+
+// AuditResult is the outcome of asking a node for a shard it should hold.
+type AuditResult struct {
+	Node   string `json:"node"`
+	Hash   string `json:"hash"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // ShardRef says where one shard of a chunk lives.
@@ -84,7 +97,7 @@ func (s *Store) writable() []Node {
 	now := time.Now()
 	var out []Node
 	for _, n := range s.Nodes() {
-		if t, ok := s.down[n.ID]; ok && now.Before(t) {
+		if t, ok := s.down[n.ID]; (ok && now.Before(t)) || n.Suspended {
 			continue
 		}
 		out = append(out, n)
@@ -162,14 +175,12 @@ func (s *Store) writeSealed(ctx context.Context, objectID string, idx uint64, se
 		return ChunkRef{}, err
 	}
 	byID := map[string]Node{}
-	ids := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		byID[n.ID] = n
-		ids = append(ids, n.ID)
 	}
 	// Rank every node for this chunk; shard i goes to the i-th ranked node,
 	// and falls through to later ones if that node fails.
-	ranked := Place(objectID+"/"+strconv.FormatUint(idx, 10), ids, len(ids))
+	ranked := Rank(objectID+"/"+strconv.FormatUint(idx, 10), nodes, k)
 
 	type result struct {
 		ref ShardRef

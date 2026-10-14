@@ -53,6 +53,7 @@ type Meta interface {
 	AllUploads() []s3meta.Segment
 	MoveShards(bucket, key, segmentID string, moves []s3meta.ShardMove) error
 	Recode(bucket, key, segmentID, oldSum string, layout storage.Layout) error
+	RecordAudits(results []storage.AuditResult) error
 }
 
 // Repairer finds and rebuilds missing shards.
@@ -72,14 +73,20 @@ type Repairer struct {
 	// UpgradeBytes bounds the data re-coded per pass; 0 means
 	// DefaultUpgradeBytes, negative disables upgrades.
 	UpgradeBytes int64
-	Logger       *log.Logger
-	Now          func() time.Time
+	// AuditEvery is how often each storage node is audited; 0 means
+	// DefaultAuditEvery, negative disables audits.
+	AuditEvery time.Duration
+	Logger     *log.Logger
+	Now        func() time.Time
 
 	mu       sync.Mutex
 	started  time.Time
 	lastSeen map[string]time.Time
 	lastScan time.Time
 	unref    map[string]time.Time // "node/hash" -> first seen unreferenced
+
+	lastAudit map[string]time.Time // node -> last audited
+	badShards map[string]time.Time // "node/hash" -> failed an audit at
 }
 
 // Stats summarises a pass.
@@ -234,6 +241,7 @@ func (r *Repairer) pass(ctx context.Context, alive map[string]storage.Node, scan
 	}
 	objects := r.Meta.AllObjects()
 	uploads := r.Meta.AllUploads()
+	r.audit(ctx, alive, objects)
 	type candidate struct {
 		obj s3meta.Object
 		seg s3meta.Segment
@@ -398,13 +406,19 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 		holders := map[string]bool{}
 		lost := map[int]storage.Node{} // shards a live node no longer has
 		waiting := false
+		trusted := 0
 		for _, sh := range c.Shards {
 			holders[sh.Node] = true
 			switch {
-			case alive[sh.Node].ID != "" && !inv.has(sh.Node, sh.Hash):
+			case alive[sh.Node].Suspended:
+				// Failed its audits: the shard moves to another node.
+			case alive[sh.Node].ID != "" && (!inv.has(sh.Node, sh.Hash) || r.failedAudit(sh.Node, sh.Hash)):
 				lost[sh.Index] = alive[sh.Node]
 			case alive[sh.Node].ID != "":
 				healthy[sh.Index] = true
+				if alive[sh.Node].Trusted {
+					trusted++
+				}
 			case !r.gone(sh.Node):
 				waiting = true // down, but maybe only for a reboot
 			}
@@ -425,7 +439,11 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 			continue
 		}
 		restored := 0
-		ranked := storage.Place(seg.ID+"/"+strconv.Itoa(ci), ids, len(ids))
+		nodes := make([]storage.Node, 0, len(ids))
+		for _, id := range ids {
+			nodes = append(nodes, alive[id])
+		}
+		ranked := storage.Rank(seg.ID+"/"+strconv.Itoa(ci), nodes, l.DataShards-trusted)
 		next := 0
 		for idx := 0; idx < total; idx++ {
 			if healthy[idx] {
@@ -440,6 +458,7 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 				// Its node is alive: put it back where the layout says.
 				if err := r.Store.Client.Put(ctx, n, hash, shards[idx]); err == nil {
 					restored++
+					r.clearAudit(n.ID, hash)
 				}
 				continue
 			}

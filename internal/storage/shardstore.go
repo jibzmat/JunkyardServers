@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -22,14 +24,53 @@ var ErrNotFound = errors.New("storage: shard not found")
 // deep so no directory gets huge.
 type ShardStore struct {
 	dir string
+
+	// Quota is the most this node stores, in bytes (0: no limit), and
+	// KeepFree how much of its filesystem must stay free. A put past
+	// either fails with ErrFull, and writers place the shard elsewhere.
+	Quota    int64
+	KeepFree int64
+
+	used atomic.Int64
 }
+
+// ErrFull means the node has reached its storage quota.
+var ErrFull = errors.New("storage: this node's storage quota is used up")
 
 // OpenShardStore uses dir, creating it if needed.
 func OpenShardStore(dir string) (*ShardStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &ShardStore{dir: dir}, nil
+	s := &ShardStore{dir: dir}
+	var used int64
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if info, err := d.Info(); err == nil {
+				used += info.Size()
+			}
+		}
+		return nil
+	})
+	s.used.Store(used)
+	return s, err
+}
+
+// Used is how many bytes of shards this node holds.
+func (s *ShardStore) Used() int64 { return s.used.Load() }
+
+// room reports whether n more bytes fit.
+func (s *ShardStore) room(n int64) bool {
+	if s.Quota > 0 && s.used.Load()+n > s.Quota {
+		return false
+	}
+	if s.KeepFree > 0 {
+		var fs syscall.Statfs_t
+		if err := syscall.Statfs(s.dir, &fs); err == nil && int64(fs.Bavail)*int64(fs.Bsize)-n < s.KeepFree {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ShardStore) path(hash string) string {
@@ -52,6 +93,9 @@ func (s *ShardStore) Put(hash string, data []byte) error {
 		now := time.Now()
 		return os.Chtimes(p, now, now)
 	}
+	if !s.room(int64(len(data))) {
+		return ErrFull
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
@@ -71,7 +115,11 @@ func (s *ShardStore) Put(hash string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), p)
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		return err
+	}
+	s.used.Add(int64(len(data)))
+	return nil
 }
 
 // Get returns a shard, re-checking its hash so bit rot is caught here
@@ -94,7 +142,7 @@ func (s *ShardStore) Get(hash string) ([]byte, error) {
 	}
 	if ShardHash(data) != hash {
 		// Bit rot: drop it so the shard shows as missing and gets rebuilt.
-		os.Remove(s.path(hash))
+		s.Delete(hash)
 		return nil, errHashMismatch
 	}
 	return data, nil
@@ -149,9 +197,19 @@ func (s *ShardStore) Delete(hash string) error {
 	if !ValidHash(hash) {
 		return fmt.Errorf("storage: bad shard name %q", hash)
 	}
-	err := os.Remove(s.path(hash))
+	info, err := os.Stat(s.path(hash))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = os.Remove(s.path(hash))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err == nil {
+		s.used.Add(-info.Size())
 	}
 	return err
 }

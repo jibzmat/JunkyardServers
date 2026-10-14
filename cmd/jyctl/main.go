@@ -245,16 +245,28 @@ func cmdMembers(args []string) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tMESH IP\tTIER\tROLES\tSHARD PORT\tCORES\tRAM\tSEV-SNP/TDX")
+	fmt.Fprintln(tw, "NODE\tMESH IP\tTIER\tROLES\tSHARD PORT\tCORES\tRAM\tSEV-SNP/TDX\tAUDITS")
 	for _, m := range members {
 		port := "-"
 		if m.StoragePort != 0 {
 			port = strconv.Itoa(m.StoragePort)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\t%d\t%s\t%v\n", m.NodeID, m.MeshIP, m.Tier, m.Roles, port,
-			m.Hardware.Cores, gib(m.Hardware.MemBytes), m.Hardware.Confidential())
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\t%d\t%s\t%v\t%s\n", m.NodeID, m.MeshIP, m.Tier, m.Roles, port,
+			m.Hardware.Cores, gib(m.Hardware.MemBytes), m.Hardware.Confidential(), audits(m.Audits))
 	}
 	return tw.Flush()
+}
+
+// audits summarises a node's storage audits: passed/failed and its score.
+func audits(a cluster.AuditRecord) string {
+	if a.Passed == 0 && a.Failed == 0 {
+		return "-"
+	}
+	out := fmt.Sprintf("%d ok, %d failed, score %.2f", a.Passed, a.Failed, a.Score)
+	if a.Suspended {
+		out += " (suspended)"
+	}
+	return out
 }
 
 func cmdWGConfig(args []string) error {

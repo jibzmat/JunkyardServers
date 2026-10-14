@@ -289,3 +289,65 @@ func TestOnlyAllowedCallersDelete(t *testing.T) {
 		t.Fatalf("shard still there: %v", err)
 	}
 }
+
+func TestRankPutsTrustedNodesFirst(t *testing.T) {
+	var nodes []Node
+	for i := 0; i < 8; i++ {
+		nodes = append(nodes, Node{ID: fmt.Sprintf("n-%d", i), Trusted: i < 3, Suspended: i == 7})
+	}
+	for c := 0; c < 50; c++ {
+		r := Rank(fmt.Sprint("chunk-", c), nodes, 2)
+		if len(r) != 7 {
+			t.Fatalf("ranked %d nodes (a suspended one included?): %v", len(r), r)
+		}
+		for _, id := range r[:2] {
+			if id != "n-0" && id != "n-1" && id != "n-2" {
+				t.Fatalf("chunk %d: %v; want trusted nodes first", c, r)
+			}
+		}
+		seen := map[string]bool{}
+		for _, id := range r {
+			if seen[id] || id == "n-7" {
+				t.Fatalf("bad ranking %v", r)
+			}
+			seen[id] = true
+		}
+	}
+	// With no trusted nodes it is plain rendezvous order.
+	plain := []Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	if got, want := Rank("x", plain, 2), Place("x", []string{"a", "b", "c"}, 3); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("%v != %v", got, want)
+	}
+}
+
+func TestShardStoreQuota(t *testing.T) {
+	st, err := OpenShardStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Quota = 10
+	a, b := []byte("12345678"), []byte("abcdefgh")
+	if err := st.Put(ShardHash(a), a); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(ShardHash(b), b); !errors.Is(err, ErrFull) {
+		t.Fatalf("over quota: %v", err)
+	}
+	if err := st.Put(ShardHash(a), a); err != nil {
+		t.Fatalf("re-putting a held shard: %v", err)
+	}
+	if err := st.Delete(ShardHash(a)); err != nil {
+		t.Fatal(err)
+	}
+	if st.Used() != 0 {
+		t.Fatalf("used %d after delete", st.Used())
+	}
+	if err := st.Put(ShardHash(b), b); err != nil {
+		t.Fatal(err)
+	}
+	// Usage survives a restart.
+	again, err := OpenShardStore(st.dir)
+	if err != nil || again.Used() != int64(len(b)) {
+		t.Fatalf("reopened: used %d, %v", again.Used(), err)
+	}
+}

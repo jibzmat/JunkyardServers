@@ -202,6 +202,26 @@ instances reach the internet through NAT.
   longer.
 - Not yet: incremental resync (a restart copies the whole disk again),
   choosing a new replica for a detached volume, and a copy on a third PC.
+- Proof of storage: every 10 minutes the repair leader asks each storage
+  node for one shard picked at random from those the metadata places
+  there. The shard's name is the hash of its bytes, so the node can't
+  answer without keeping them, and an audit looks like any read. A shard
+  that fails is rebuilt like a lost one. Costs about 6 MiB an hour per
+  node.
+- Reputation: audit results are recorded per node in the Raft state.
+  The score starts at 1 for the owner's PCs and 0.5 for strangers', moves
+  10% of the way to 1 with each audit passed and halves with each one
+  failed. Below 0.2 the node is suspended: no new shards, no new
+  instances or replicas, and repair moves its shards elsewhere. Suspended
+  nodes are still audited and are reinstated at 0.4 (about four passes
+  in a row). `jyctl members` shows each node's record.
+- Quotas: a storage node stores at most `-storage-quota` bytes and always
+  leaves 10% of its disk (up to 20 GiB) free; past that its shard server
+  answers 507 and writers place the shard on the next node. Shards are
+  written to the owner's trusted PCs first, up to k per chunk, so when
+  there are k trusted storage PCs every chunk survives all strangers' PCs
+  vanishing at once. Repair follows the same order. Chunks written before
+  enough trusted PCs existed are not moved yet.
 
 ## Roadmap
 

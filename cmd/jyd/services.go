@@ -43,11 +43,18 @@ func mayDelete(a *agent.Agent) func(*x509.Certificate) bool {
 }
 
 // startStorage serves this node's shards to the cluster.
-func startStorage(dir string, n *node.Node, a *agent.Agent, logger *log.Logger) (*http.Server, error) {
+func startStorage(dir string, n *node.Node, a *agent.Agent, quota int64, logger *log.Logger) (*http.Server, error) {
 	st, err := storage.OpenShardStore(filepath.Join(dir, "shards"))
 	if err != nil {
 		return nil, err
 	}
+	st.Quota = quota
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(filepath.Join(dir, "shards"), &fs); err == nil {
+		// Leave the PC's owner 10% of the disk, up to 20 GiB.
+		st.KeepFree = min(int64(fs.Blocks)*int64(fs.Bsize)/10, 20<<30)
+	}
+	logger.Printf("storage: holding %d MiB of shards (quota %s)", st.Used()>>20, quotaText(quota))
 	ss := &storage.ShardServer{Store: st, Cert: n.TLSCertificate(), CA: n.CA, MayDelete: mayDelete(a)}
 	ln, err := net.Listen("tcp", ":"+strconv.Itoa(n.Config.StoragePort))
 	if err != nil {
@@ -115,7 +122,8 @@ func storageNodes(a *agent.Agent) []storage.Node {
 			continue
 		}
 		if addr := a.StorageAddr(m); addr != "" {
-			out = append(out, storage.Node{ID: m.NodeID, Addr: addr, Name: m.MeshIP})
+			out = append(out, storage.Node{ID: m.NodeID, Addr: addr, Name: m.MeshIP,
+				Trusted: m.Tier == cluster.TierTrusted, Suspended: m.Audits.Suspended})
 		}
 	}
 	return out
@@ -199,4 +207,11 @@ func tuneReplicaConn(_, _ string, c syscall.RawConn) error {
 		return err
 	}
 	return serr
+}
+
+func quotaText(q int64) string {
+	if q == 0 {
+		return "none; 10% of the disk, up to 20 GiB, is kept free"
+	}
+	return fmt.Sprintf("%d MiB", q>>20)
 }

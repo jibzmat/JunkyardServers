@@ -139,11 +139,12 @@ type command struct {
 	KEKEpoch int               `json:"kek_epoch,omitempty"`
 	Sealed   map[string][]byte `json:"sealed,omitempty"` // tenant -> master key sealed by the new KEK
 
-	SegmentID string             `json:"segment_id,omitempty"`
-	Moves     []s3meta.ShardMove `json:"moves,omitempty"`
-	EC2       *ec2Command        `json:"ec2,omitempty"`
-	Layout    *storage.Layout    `json:"layout,omitempty"`  // recode: the new layout
-	OldLayout string             `json:"old_sum,omitempty"` // recode: Sum of the layout replaced
+	SegmentID string                `json:"segment_id,omitempty"`
+	Moves     []s3meta.ShardMove    `json:"moves,omitempty"`
+	EC2       *ec2Command           `json:"ec2,omitempty"`
+	Layout    *storage.Layout       `json:"layout,omitempty"`  // recode: the new layout
+	OldLayout string                `json:"old_sum,omitempty"` // recode: Sum of the layout replaced
+	Audits    []storage.AuditResult `json:"audits,omitempty"`
 }
 
 // Errors the state machine can return for a command.
@@ -186,6 +187,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		err = f.applyMoves(c)
 	case opRecode:
 		err = f.applyRecode(c)
+	case opAudits:
+		err = f.applyAudits(c)
 	case opRunInstances, opInstanceAction, opAssign, opUnassign, opInstanceReport, opPurgeInstances,
 		opPutKeyPair, opDeleteKeyPair, opPutImage, opDeleteImage, opTags,
 		opCreateVPC, opDeleteVPC, opCreateSubnet, opDeleteSubnet, opCreateGroup, opDeleteGroup, opGroupRules, opDefaultVPC,

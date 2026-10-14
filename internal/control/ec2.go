@@ -837,7 +837,7 @@ func (s *Server) schedulerLoop() {
 
 // eligible reports whether member m may run instance in, ignoring load.
 func (s *Server) eligible(m *cluster.Member, in ec2meta.Instance, emulate bool) bool {
-	if !hasRole(m.Roles, cluster.RoleCompute) || (!m.Hardware.KVM && !emulate) {
+	if !hasRole(m.Roles, cluster.RoleCompute) || (!m.Hardware.KVM && !emulate) || m.Audits.Suspended {
 		return false
 	}
 	switch in.Placement {
