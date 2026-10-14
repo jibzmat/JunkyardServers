@@ -206,7 +206,7 @@ func (s *Server) Object(tenant, bucket, key string) (*s3meta.Object, error) {
 			err = s3meta.Errorf(s3meta.CodeNoSuchBucket, "bucket %q does not exist", bucket)
 			return
 		}
-		if o, ok := st.Objects[bucket][key]; ok {
+		if o, ok := st.Objects[bucket].get(key); ok {
 			c := *o
 			out = &c
 		}
@@ -226,8 +226,7 @@ func (s *Server) ListObjects(req s3meta.ListRequest) (*s3meta.ListResponse, erro
 	if max <= 0 || max > defaultMaxKeys {
 		max = defaultMaxKeys
 	}
-	var keys []string
-	var objs map[string]*s3meta.Object
+	resp := &s3meta.ListResponse{Objects: []s3meta.Object{}}
 	var err error
 	s.fsm.view(func(st *state) {
 		b, ok := st.Buckets[req.Bucket]
@@ -235,54 +234,66 @@ func (s *Server) ListObjects(req s3meta.ListRequest) (*s3meta.ListResponse, erro
 			err = s3meta.Errorf(s3meta.CodeNoSuchBucket, "bucket %q does not exist", req.Bucket)
 			return
 		}
-		objs = map[string]*s3meta.Object{}
-		for k, o := range st.Objects[req.Bucket] {
-			if strings.HasPrefix(k, req.Prefix) && k > req.StartAfter {
-				keys = append(keys, k)
-				objs[k] = o
-			}
-		}
+		listPage(st.Objects[req.Bucket], req, max, resp)
 	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(keys)
+	return resp, nil
+}
 
-	resp := &s3meta.ListResponse{Objects: []s3meta.Object{}}
-	seen := map[string]bool{}
+// listPage fills resp with up to max keys and common prefixes after
+// req.StartAfter. It walks the bucket's key index, jumping over each common
+// prefix's keys rather than visiting them.
+func listPage(objs *objectSet, req s3meta.ListRequest, max int, resp *s3meta.ListResponse) {
+	from := req.Prefix
+	if req.StartAfter >= from {
+		from = req.StartAfter + "\x00"
+	}
 	last := ""
-	for _, k := range keys {
-		if req.Delimiter != "" {
-			rest := k[len(req.Prefix):]
-			if i := strings.Index(rest, req.Delimiter); i >= 0 {
-				cp := req.Prefix + rest[:i+len(req.Delimiter)]
-				// A continuation may resume right after a common prefix.
-				if seen[cp] || cp <= req.StartAfter {
-					continue
-				}
-				if len(resp.Objects)+len(resp.CommonPrefixes) == max {
-					resp.Truncated = true
-					break
-				}
-				seen[cp] = true
-				resp.CommonPrefixes = append(resp.CommonPrefixes, cp)
-				last = cp
-				continue
+	for {
+		var skipTo string
+		objs.ascend(from, func(k string, o *s3meta.Object) bool {
+			if !strings.HasPrefix(k, req.Prefix) {
+				return false // past the prefix
 			}
-		}
-		if len(resp.Objects)+len(resp.CommonPrefixes) == max {
-			resp.Truncated = true
+			if req.Delimiter != "" {
+				rest := k[len(req.Prefix):]
+				if i := strings.Index(rest, req.Delimiter); i >= 0 {
+					cp := req.Prefix + rest[:i+len(req.Delimiter)]
+					// A continuation may resume inside a common prefix
+					// already returned.
+					if cp > req.StartAfter {
+						if len(resp.Objects)+len(resp.CommonPrefixes) == max {
+							resp.Truncated = true
+							return false
+						}
+						resp.CommonPrefixes = append(resp.CommonPrefixes, cp)
+						last = cp
+					}
+					// Every key after an all-0xff prefix shares it.
+					skipTo = prefixEnd(cp)
+					return false
+				}
+			}
+			if len(resp.Objects)+len(resp.CommonPrefixes) == max {
+				resp.Truncated = true
+				return false
+			}
+			c := *o
+			c.WrappedKey, c.Layout, c.Parts = nil, storage.Layout{}, nil
+			resp.Objects = append(resp.Objects, c)
+			last = k
+			return true
+		})
+		if skipTo == "" || resp.Truncated {
 			break
 		}
-		o := *objs[k]
-		o.WrappedKey, o.Layout, o.Parts = nil, storage.Layout{}, nil
-		resp.Objects = append(resp.Objects, o)
-		last = k
+		from = skipTo
 	}
 	if resp.Truncated {
 		resp.Next = last
 	}
-	return resp, nil
 }
 
 // CreateUpload starts a multipart upload.
@@ -377,9 +388,7 @@ func (s *Server) AllObjects() []s3meta.Object {
 	var out []s3meta.Object
 	s.fsm.view(func(st *state) {
 		for _, objs := range st.Objects {
-			for _, o := range objs {
-				out = append(out, *o)
-			}
+			objs.each(func(o *s3meta.Object) { out = append(out, *o) })
 		}
 	})
 	return out

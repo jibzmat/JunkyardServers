@@ -38,11 +38,11 @@ type state struct {
 	Controls  map[string]*ControlInfo    `json:"controls"`
 
 	// S3 metadata.
-	Tenants    map[string]*s3meta.Tenant            `json:"tenants"`
-	AccessKeys map[string]*s3meta.AccessKey         `json:"access_keys"`
-	Buckets    map[string]*s3meta.Bucket            `json:"buckets"`
-	Objects    map[string]map[string]*s3meta.Object `json:"objects"` // bucket -> key -> object
-	Uploads    map[string]*s3meta.Upload            `json:"uploads"` // multipart uploads by ID
+	Tenants    map[string]*s3meta.Tenant    `json:"tenants"`
+	AccessKeys map[string]*s3meta.AccessKey `json:"access_keys"`
+	Buckets    map[string]*s3meta.Bucket    `json:"buckets"`
+	Objects    map[string]*objectSet        `json:"objects"` // bucket -> key -> object
+	Uploads    map[string]*s3meta.Upload    `json:"uploads"` // multipart uploads by ID
 
 	KEK *kekState `json:"kek,omitempty"`
 }
@@ -74,7 +74,7 @@ func (st *state) fill() {
 		st.Buckets = map[string]*s3meta.Bucket{}
 	}
 	if st.Objects == nil {
-		st.Objects = map[string]map[string]*s3meta.Object{}
+		st.Objects = map[string]*objectSet{}
 	}
 	if st.Uploads == nil {
 		st.Uploads = map[string]*s3meta.Upload{}
@@ -192,7 +192,7 @@ var errStale = errors.New("control: object changed during repair")
 // applyMoves records rebuilt shards. Stored objects are never modified in
 // place (readers hold shallow copies), so the object is copied first.
 func (f *fsm) applyMoves(c command) error {
-	old, ok := f.st.Objects[c.Name][c.Key]
+	old, ok := f.st.Objects[c.Name].get(c.Key)
 	if !ok {
 		return errStale
 	}
@@ -235,7 +235,7 @@ func (f *fsm) applyMoves(c command) error {
 			ch.Shards = append(ch.Shards, storage.ShardRef{Index: mv.Index, Hash: mv.Hash, Node: mv.Node})
 		}
 	}
-	f.st.Objects[c.Name][c.Key] = obj
+	f.st.Objects[c.Name].set(c.Key, obj)
 	return nil
 }
 
@@ -304,11 +304,11 @@ func (f *fsm) applyUpload(c command) (any, error) {
 	}
 	objs := st.Objects[u.Bucket]
 	if objs == nil {
-		objs = map[string]*s3meta.Object{}
+		objs = newObjectSet()
 		st.Objects[u.Bucket] = objs
 	}
-	resp.Old = objs[u.Key]
-	objs[u.Key] = obj
+	resp.Old, _ = objs.get(u.Key)
+	objs.set(u.Key, obj)
 	delete(st.Uploads, u.ID)
 	return resp, nil
 }
@@ -327,14 +327,14 @@ func (f *fsm) applyObject(c command) (*s3meta.Object, error) {
 	}
 	objs := st.Objects[name]
 	if objs == nil {
-		objs = map[string]*s3meta.Object{}
+		objs = newObjectSet()
 		st.Objects[name] = objs
 	}
-	old := objs[key]
+	old, _ := objs.get(key)
 	if c.Op == opPutObject {
-		objs[key] = c.Object
+		objs.set(key, c.Object)
 	} else {
-		delete(objs, key)
+		objs.del(key)
 	}
 	return old, nil
 }
@@ -394,7 +394,7 @@ func (f *fsm) apply(c command) error {
 		if !ok || b.Tenant != c.Owner {
 			return s3meta.Errorf(s3meta.CodeNoSuchBucket, "bucket %q does not exist", c.Name)
 		}
-		if len(st.Objects[c.Name]) > 0 {
+		if st.Objects[c.Name].len() > 0 {
 			return s3meta.Errorf(s3meta.CodeBucketNotEmpty, "bucket %q is not empty", c.Name)
 		}
 		for _, u := range st.Uploads {

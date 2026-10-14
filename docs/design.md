@@ -95,7 +95,12 @@ the control plane registry.
 - Strangers' PCs are supported from v1 with full storage and compute features.
 - None of the first PCs have SEV-SNP or TDX, so placement `any` is available
   from the start.
-- M1 includes a gateway-side encrypted listing index for large buckets.
+- Listing large buckets: each bucket's keys are kept in a sorted B-tree in
+  the control plane's state, so a page of 1000 keys costs O(log n + 1000)
+  and common prefixes are skipped over rather than walked (about 5 ms for
+  two pages of a million-key bucket). Names are plaintext there because
+  control nodes already hold tenant keys; the gateway-side encrypted index
+  comes with moving metadata to PCs that don't.
 - A fully decentralized control plane is the goal: metadata split into many
   small Raft groups whose members are picked automatically from healthy
   owner-trusted PCs. M0 replicates the control plane with Raft across control

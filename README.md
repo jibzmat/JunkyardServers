@@ -148,8 +148,9 @@ M1:
 
 - Objects written while PCs were down keep the thinner coding that fit the
   PCs left; repair restores missing shards but doesn't upgrade the coding.
-- The gateway-side encrypted listing index for large buckets. Listing works
-  today from the control plane's state.
+- Object names are plaintext in the control plane's state, which only your
+  trusted PCs hold. Encrypting them, with gateways building the listing
+  index, waits until metadata moves to PCs that don't hold keys.
 
 From M0:
 

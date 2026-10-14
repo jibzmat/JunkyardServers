@@ -3,6 +3,7 @@ module github.com/jibzmat/JunkyardServers
 go 1.25.0
 
 require (
+	github.com/google/btree v1.1.3
 	github.com/hashicorp/memberlist v0.7.0
 	github.com/hashicorp/raft v1.8.0
 	github.com/klauspost/reedsolomon v1.14.2
@@ -13,7 +14,6 @@ require (
 
 require (
 	github.com/fatih/color v1.13.0 // indirect
-	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
