@@ -81,3 +81,8 @@ go vet ./... && go test -race ./...
   group comes next.
 - NAT traversal and relays for PCs that can't reach each other directly.
 - Certificate rotation and revocation.
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE). If you run a modified
+version as a network service, you must offer its users the source.

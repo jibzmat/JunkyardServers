@@ -47,3 +47,16 @@ the control plane registry.
 | M3 VPC networking | VPCs, subnets, IPAM, VXLAN inside WireGuard, security groups | SGs enforced across PCs |
 | M4 Peer hardening | proof-of-storage audits, reputation and quotas, restart on host loss | VM restarts on a new PC |
 | M5 Scale out | cluster instances, live migration, NAT gateway, elastic IPs | one instance ID spans 4 PCs |
+
+## Decisions
+
+- Strangers' PCs are supported from v1 with full storage and compute features.
+- None of the first PCs have SEV-SNP or TDX, so placement `any` is available
+  from the start.
+- M1 includes a gateway-side encrypted listing index for large buckets.
+- A fully decentralized control plane is the goal: metadata split into many
+  small Raft groups whose members are picked automatically from healthy
+  owner-trusted PCs. M0's single control PC is a stepping stone. Strangers'
+  PCs without SEV-SNP/TDX never hold metadata keys or CA signing power.
+- License: AGPL-3.0, so MinIO code (also AGPL-3.0) can be reused with
+  attribution.
