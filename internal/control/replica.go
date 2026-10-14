@@ -40,6 +40,9 @@ func (f *fsm) applyReplica(c command) (any, bool, error) {
 		}
 		n := *in
 		n.Replica, n.ReplicaSynced = x.Target, false
+		if n.MigrateTo != x.Target {
+			n.MigrateTo = "" // it was going to the old replica
+		}
 		e.Instances[n.ID] = &n
 		for id, v := range e.Volumes {
 			if v.Instance == n.ID {
@@ -91,7 +94,7 @@ func (f *fsm) applyReplica(c command) (any, bool, error) {
 			return nil, true, errStale
 		}
 		to := n.Replica
-		n.Host, n.Replica, n.ReplicaSynced, n.Recovered = to, "", false, true
+		n.Host, n.Replica, n.ReplicaSynced, n.Recovered, n.MigrateTo = to, "", false, true, ""
 		n.StateReason = failoverReason
 		e.Instances[n.ID] = &n
 		for id, v := range e.Volumes {
@@ -155,7 +158,7 @@ func (s *Server) scheduleReplicas(alive map[string]bool, now time.Time) error {
 	isAlive := func(id string) bool { return alive == nil || alive[id] }
 	lost := map[string]bool{}
 	type move struct{ id, host, target string }
-	var failovers, volMoves, replicas []move
+	var failovers, volMoves, replicas, migrations []move
 	s.fsm.view(func(st *state) {
 		for id := range st.Members {
 			if s.lostFor(alive, id, now) > hostLostAfter {
@@ -191,6 +194,10 @@ func (s *Server) scheduleReplicas(alive map[string]bool, now time.Time) error {
 			}
 			if in.Replica != "" && !lost[in.Replica] {
 				if m, ok := st.Members[in.Replica]; ok && s.eligible(m, *in, opts.AllowEmulation) {
+					// A drained host's instances move to their replicas.
+					if h := st.Members[in.Host]; h != nil && h.Drained && in.State == ec2meta.StateRunning && in.MigrateTo == "" {
+						migrations = append(migrations, move{in.ID, in.Host, in.Replica})
+					}
 					continue
 				}
 			}
@@ -227,6 +234,11 @@ func (s *Server) scheduleReplicas(alive map[string]bool, now time.Time) error {
 	}
 	for _, m := range volMoves {
 		if _, err := s.ec2Apply(opMoveVolume, "", ec2Command{IDs: []string{m.id}, Host: m.host}); err != nil && !errors.Is(err, errStale) {
+			errs = append(errs, err)
+		}
+	}
+	for _, m := range migrations {
+		if _, err := s.ec2Apply(opMigrate, "", ec2Command{IDs: []string{m.id}, Host: m.host, Target: m.target}); err != nil && !errors.Is(err, errStale) {
 			errs = append(errs, err)
 		}
 	}

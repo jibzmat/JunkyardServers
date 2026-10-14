@@ -189,12 +189,14 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		err = f.applyRecode(c)
 	case opAudits:
 		err = f.applyAudits(c)
+	case opReinstate:
+		err = f.applyReinstate(c)
 	case opRunInstances, opInstanceAction, opAssign, opUnassign, opInstanceReport, opPurgeInstances,
 		opPutKeyPair, opDeleteKeyPair, opPutImage, opDeleteImage, opTags,
 		opCreateVPC, opDeleteVPC, opCreateSubnet, opDeleteSubnet, opCreateGroup, opDeleteGroup, opGroupRules, opDefaultVPC,
 		opCreateVolume, opDeleteVolume, opAttachVolume, opDetachVolume, opVolumeReport,
 		opCreateSnapshot, opDeleteSnapshot, opCreateImage, opTaskDone, opTaskFailed,
-		opSetReplica, opReplicaReport, opFailover, opMoveVolume:
+		opSetReplica, opReplicaReport, opFailover, opMoveVolume, opMigrate, opMigrated, opDrain:
 		res, err = f.applyEC2(c)
 	default:
 		return f.apply(c)

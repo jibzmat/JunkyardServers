@@ -144,6 +144,9 @@ type Member struct {
 
 	// Reputation from storage audits (see control's audit.go).
 	Audits AuditRecord `json:"audits,omitempty"`
+	// Drained nodes get no new instances or replicas; their running
+	// instances are live-migrated away (jyctl drain).
+	Drained bool `json:"drained,omitempty"`
 }
 
 // AuditRecord is a storage node's audit history and standing.

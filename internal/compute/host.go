@@ -36,6 +36,8 @@ type VM struct {
 type Disk struct {
 	ID   string
 	Path string
+	// Bus is the root port to plug it into (rp1...); default by order.
+	Bus string
 }
 
 // Driver runs VMs. QEMU is the real one.
@@ -73,9 +75,23 @@ type Driver interface {
 	DiskSize(ctx context.Context, path string) (int64, error)
 	// Export serves a disk copy (made blank at size if missing) over NBD
 	// on socket, unless it already is.
-	Export(ctx context.Context, path string, size int64, socket string) error
+	Export(ctx context.Context, path, name string, size int64, socket string) error
 	// Unexport stops serving the copy on socket.
 	Unexport(socket string)
+
+	// Ports returns the root port of each volume plugged into a VM.
+	Ports(vm *VM) (map[string]string, error)
+	// Migrate sends a running VM to the incoming VM listening on socket
+	// and returns once all of it is sent, with the guest paused here.
+	Migrate(ctx context.Context, vm *VM, socket string) error
+	// Resume runs a guest paused by Migrate again.
+	Resume(vm *VM) error
+	// StartIncoming boots a prepared VM waiting for a migration on socket,
+	// with its disks served over NBD on nbd under their IDs.
+	StartIncoming(ctx context.Context, vm *VM, socket, nbd string, disks []string) error
+	// FinishIncoming waits for the migrated guest to run and stops the
+	// NBD server.
+	FinishIncoming(ctx context.Context, vm *VM) error
 }
 
 // Control is what the host needs from the control plane; *control.Client
@@ -90,6 +106,7 @@ type Control interface {
 	FetchSnapshot(ctx context.Context, id string, w io.Writer) error
 	SendConsole(ctx context.Context, c ec2meta.ConsoleOutput) error
 	ReportReplica(ctx context.Context, r ec2meta.ReplicaReport) error
+	ReportMigration(ctx context.Context, r ec2meta.MigrationReport) error
 }
 
 // Network is the PC's VPC networking; *vnet.Manager implements it.
@@ -138,6 +155,12 @@ type Host struct {
 	staleReplicas map[string]time.Time    // copies no longer wanted, since when
 	replicaConns  map[string]net.Conn     // disk -> its primary's connection
 	retries       map[string]*mirrorRetry // instance -> when to start its mirrors again
+
+	// Live migration (migrate.go).
+	incoming      map[string]*VM       // instances migrating here
+	migrating     map[string]string    // disk -> the incoming VM's NBD socket
+	migrateFailed map[string]time.Time // instance -> last failed migration
+	migrateWait   map[string]time.Time // instance -> since when its target is not ready
 }
 
 // retryAfter is how long a failed start waits before the next try.
@@ -229,6 +252,14 @@ func (h *Host) Step(ctx context.Context) error {
 	}
 	h.closeProxies(mirrored)
 	assigned := map[string]bool{}
+	incoming := map[string]*VM{}
+	for _, in := range v.Incoming {
+		assigned[in.ID] = true
+		incoming[in.ID] = &VM{Instance: in, Subnet: subnets[in.SubnetID], NetNS: vnet.NSName(in.VpcID), Dir: h.instanceDir(in.ID)}
+	}
+	h.mu.Lock()
+	h.incoming = incoming
+	h.mu.Unlock()
 	for _, in := range v.Instances {
 		assigned[in.ID] = true
 		vm := &VM{Instance: in, Subnet: subnets[in.SubnetID], NetNS: vnet.NSName(in.VpcID), Dir: h.instanceDir(in.ID), Volumes: attached[in.ID]}
@@ -354,6 +385,9 @@ func (h *Host) reconcile(ctx context.Context, vm *VM) {
 		}
 		h.syncVolumes(ctx, vm, true)
 		h.syncMirrors(ctx, vm)
+		if in.MigrateTo != "" && in.MigrateTo == in.Replica && in.ReplicaSynced && h.DialReplica != nil {
+			h.migrate(ctx, vm)
+		}
 
 	case ec2meta.StateStopping:
 		if err := h.Driver.Stop(ctx, vm, true); err != nil {

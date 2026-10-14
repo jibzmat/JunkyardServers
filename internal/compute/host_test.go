@@ -2,6 +2,7 @@ package compute
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http/httptest"
@@ -27,6 +28,14 @@ type fakeControl struct {
 	uploads  map[string]string
 	consoles map[string]string
 	replicas []ec2meta.ReplicaReport
+	migrated []ec2meta.MigrationReport
+}
+
+func (f *fakeControl) ReportMigration(_ context.Context, r ec2meta.MigrationReport) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.migrated = append(f.migrated, r)
+	return nil
 }
 
 func (f *fakeControl) ReportReplica(_ context.Context, r ec2meta.ReplicaReport) error {
@@ -182,6 +191,97 @@ type fakeDriver struct {
 	stops   int
 	mirrors map[string]map[string]MirrorState // instance -> disk -> state
 	exports map[string]net.Listener           // socket -> fake NBD server
+	paused  map[string]bool
+	memory  map[string]string // instance -> migration stream received
+	// failIncoming makes incoming migrations fail.
+	failIncoming bool
+}
+
+// The fake migration stream is "memory of <id>".
+func (d *fakeDriver) Ports(vm *VM) (map[string]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ports := map[string]string{}
+	i := 1
+	for id := range d.plugged[vm.Instance.ID] {
+		ports[id] = fmt.Sprintf("rp%d", i)
+		i++
+	}
+	return ports, nil
+}
+
+func (d *fakeDriver) Migrate(_ context.Context, vm *VM, socket string) error {
+	c, err := net.Dial("unix", socket)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, "memory of "+vm.Instance.ID); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.paused == nil {
+		d.paused = map[string]bool{}
+	}
+	d.paused[vm.Instance.ID] = true
+	return nil
+}
+
+func (d *fakeDriver) Resume(vm *VM) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.paused, vm.Instance.ID)
+	return nil
+}
+
+func (d *fakeDriver) StartIncoming(ctx context.Context, vm *VM, socket, nbd string, disks []string) error {
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		return err
+	}
+	if err := d.Start(ctx, vm); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.paused[vm.Instance.ID] = true
+	d.mu.Unlock()
+	go func() {
+		defer ln.Close()
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		b, _ := io.ReadAll(c)
+		c.Close()
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.memory == nil {
+			d.memory = map[string]string{}
+		}
+		d.memory[vm.Instance.ID] = string(b)
+	}()
+	return nil
+}
+
+func (d *fakeDriver) FinishIncoming(_ context.Context, vm *VM) error {
+	for i := 0; i < 200; i++ {
+		d.mu.Lock()
+		got, ok := d.memory[vm.Instance.ID]
+		fail := d.failIncoming
+		d.mu.Unlock()
+		if ok {
+			if fail || got != "memory of "+vm.Instance.ID {
+				return fmt.Errorf("bad stream %q", got)
+			}
+			d.mu.Lock()
+			delete(d.paused, vm.Instance.ID)
+			d.mu.Unlock()
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("no stream")
 }
 
 // The fake mirror sends the disk's bytes once to the socket; the fake NBD
@@ -245,7 +345,7 @@ func (d *fakeDriver) DiskSize(_ context.Context, path string) (int64, error) {
 	return fi.Size(), nil
 }
 
-func (d *fakeDriver) Export(_ context.Context, path string, size int64, socket string) error {
+func (d *fakeDriver) Export(_ context.Context, path, name string, size int64, socket string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.exports[socket] != nil {
@@ -366,6 +466,7 @@ func (d *fakeDriver) Start(_ context.Context, vm *VM) error {
 	defer d.mu.Unlock()
 	if d.running == nil {
 		d.running = map[string]bool{}
+		d.paused = map[string]bool{}
 	}
 	d.running[vm.Instance.ID] = true
 	if d.booted == nil {
@@ -803,4 +904,112 @@ func waitFor(t *testing.T, ok func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("timed out")
+}
+
+func TestLiveMigration(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail=%v", fail), func(t *testing.T) { testLiveMigration(t, fail) })
+	}
+}
+
+func testLiveMigration(t *testing.T, fail bool) {
+	const id = "i-0123456789abcdef0"
+	inst := ec2meta.Instance{
+		ID: id, ImageID: "ami-1", State: ec2meta.StatePending, PrivateIP: "10.128.0.10", VpcID: "vpc-1", SubnetID: "subnet-1",
+		MAC: "02:00:00:00:00:01", VCPU: 1, MemMiB: 512, RootGiB: 8, Host: "node-a", Replica: "node-b",
+	}
+	ctlA := &fakeControl{view: ec2meta.HostView{Node: "node-a", Networks: testNets, Instances: []ec2meta.Instance{inst}}}
+	ctlB := &fakeControl{view: ec2meta.HostView{Node: "node-b", Networks: testNets,
+		Replicas: []ec2meta.ReplicaDisk{{ID: id, Primary: "node-a"}}}}
+	drvA, drvB := &fakeDriver{}, &fakeDriver{failIncoming: fail}
+	b := &Host{Control: ctlB, Driver: drvB, Dir: t.TempDir(), RunDir: t.TempDir()}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go b.ServeReplicas(ln, func(net.Conn) (string, error) { return "node-a", nil })
+	a := &Host{Control: ctlA, Driver: drvA, Dir: t.TempDir(), RunDir: t.TempDir(),
+		DialReplica: func(ctx context.Context, node string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		}}
+	ctx := context.Background()
+	step := func(h *Host) {
+		t.Helper()
+		if err := h.Step(ctx); err != nil {
+			t.Fatal(err)
+		}
+		h.Wait()
+	}
+	step(b)
+	step(a) // boots
+	ctlA.mu.Lock()
+	ctlA.view.Instances[0].State = ec2meta.StateRunning
+	ctlA.mu.Unlock()
+	step(a) // mirrors
+	want, _ := os.ReadFile(filepath.Join(a.instanceDir(id), "disk.qcow2"))
+	waitFor(t, func() bool {
+		got, _ := os.ReadFile(b.replicaPath(id))
+		return string(got) == string(want)
+	})
+	step(a) // reports the copy in step
+
+	// Migrate to node-b.
+	ctlA.mu.Lock()
+	ctlA.view.Instances[0].MigrateTo = "node-b"
+	moving := ctlA.view.Instances[0]
+	ctlA.mu.Unlock()
+	step(a) // node-b doesn't know yet: a waits
+	ctlA.mu.Lock()
+	early := len(ctlA.migrated)
+	ctlA.mu.Unlock()
+	if early != 0 || !drvA.Running(&VM{Instance: inst}) {
+		t.Fatalf("migrated to a PC not expecting it: %d reports", early)
+	}
+	ctlB.mu.Lock()
+	ctlB.view.Incoming = []ec2meta.Instance{moving}
+	ctlB.mu.Unlock()
+	step(b) // expects it
+	step(a) // sends it
+
+	ctlA.mu.Lock()
+	reps := append([]ec2meta.MigrationReport(nil), ctlA.migrated...)
+	ctlA.mu.Unlock()
+	if len(reps) != 1 || reps[0].Instance != id || reps[0].To != "node-b" || reps[0].OK == fail {
+		t.Fatalf("migration reports %+v", reps)
+	}
+	vmA := &VM{Instance: inst}
+	if fail {
+		if !drvA.Running(vmA) || drvA.paused[id] {
+			t.Fatal("the guest does not run on node-a after a failed migration")
+		}
+		if drvB.Running(vmA) {
+			t.Fatal("the failed incoming VM still runs on node-b")
+		}
+		if got, err := os.ReadFile(b.replicaPath(id)); err != nil || string(got) != string(want) {
+			t.Fatalf("node-b's copy after a failed migration: %q, %v", got, err)
+		}
+		return
+	}
+	if drvA.Running(vmA) {
+		t.Fatal("still running on node-a")
+	}
+	if !drvB.Running(vmA) || drvB.paused[id] {
+		t.Fatal("not running on node-b")
+	}
+	got, err := os.ReadFile(filepath.Join(b.instanceDir(id), "disk.qcow2"))
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("node-b runs it on %q, %v; want the copy %q", got, err, want)
+	}
+	// The control plane moves it; node-b keeps it running.
+	moved := moving
+	moved.Host, moved.Replica, moved.MigrateTo = "node-b", "", ""
+	ctlB.mu.Lock()
+	ctlB.view.Incoming, ctlB.view.Replicas = nil, nil
+	ctlB.view.Instances = []ec2meta.Instance{moved}
+	ctlB.mu.Unlock()
+	step(b)
+	if !drvB.Running(vmA) || len(ctlB.reports) != 0 {
+		t.Fatalf("after the move: running %v, reports %+v", drvB.Running(vmA), ctlB.reports)
+	}
 }

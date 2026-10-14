@@ -423,6 +423,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/controls/enroll", s.requireKind(s.leaderOnly(s.handleControlEnroll), pki.KindNode))
 	mux.HandleFunc("POST /v1/controls/activate", s.requireKind(s.leaderOnly(s.handleControlActivate), pki.KindControl))
 	mux.HandleFunc("DELETE /v1/controls/{id}", s.requireKind(s.leaderOnly(s.handleControlRemove), pki.KindAdmin))
+	mux.HandleFunc("POST /v1/admin/reinstate", s.requireKind(s.leaderOnly(s.handleReinstate), pki.KindAdmin))
 	s.s3Routes(mux)
 	s.ec2Routes(mux)
 	s.vpcRoutes(mux)

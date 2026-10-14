@@ -1,6 +1,8 @@
 package control
 
 import (
+	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
@@ -13,10 +15,14 @@ import (
 // with each one failed. A node whose score falls below suspendBelow is
 // suspended: it gets no new shards or instances, and repair moves its
 // shards to other nodes. It is reinstated once passing audits bring the
-// score back to reinstateAt (suspended nodes are still audited).
+// score back to reinstateAt (suspended nodes are still audited), or when
+// the owner vouches for it (jyctl reinstate), say after replacing a bad
+// disk: a suspended node whose shards have all moved has nothing left to
+// be audited on.
 
 const (
-	opAudits = "audits"
+	opAudits    = "audits"
+	opReinstate = "reinstate"
 
 	suspendBelow = 0.2
 	reinstateAt  = 0.4
@@ -69,4 +75,36 @@ func (s *Server) RecordAudits(results []storage.AuditResult) error {
 		return nil
 	}
 	return s.apply(command{Op: opAudits, Now: s.now().UTC(), Audits: results})
+}
+
+// applyReinstate lifts a node's suspension, leaving it on probation.
+func (f *fsm) applyReinstate(c command) error {
+	m, ok := f.st.Members[c.Member.NodeID]
+	if !ok {
+		return fmt.Errorf("control: no node %q", c.Member.NodeID)
+	}
+	n := *m
+	n.Audits.Suspended = false
+	n.Audits.Score = max(n.Audits.Score, reinstateAt)
+	f.st.Members[n.NodeID] = &n
+	return nil
+}
+
+// Reinstate lifts a node's suspension (admin).
+func (s *Server) Reinstate(node string) error {
+	return s.apply(command{Op: opReinstate, Member: &cluster.Member{NodeID: node}})
+}
+
+func (s *Server) handleReinstate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Node string `json:"node"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.Reinstate(req.Node); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, struct{}{})
 }

@@ -35,6 +35,7 @@ func main() {
 	emulate := flag.Bool("emulate", false, "run instances under QEMU's emulator on PCs without KVM (slow; for trying things out)")
 	storageQuota := flag.String("storage-quota", "", "most shard data this PC stores, e.g. 500G (default: none, but 10% of the disk, up to 20 GiB, is always left free)")
 	replicaPort := flag.Int("replica-port", 7446, "port compute PCs exchange disk copies on (the same on every PC)")
+	runDir := flag.String("run-dir", "/run/junkyard", "directory for compute's unix sockets (one per jyd on a PC)")
 	repairAfter := flag.Duration("repair-after", repair.DefaultAfter, "rebuild a storage node's shards elsewhere after it has been unreachable this long")
 	flag.Parse()
 
@@ -105,7 +106,7 @@ func main() {
 		ctl.StartCompute(control.ComputeOptions{Alive: a.Alive, AllowEmulation: *emulate, Store: r.Store})
 	}
 	if hasRole(n.Config.Roles, cluster.RoleCompute) {
-		startCompute(ctx, *dir, n, a, *emulate, *replicaPort, logger)
+		startCompute(ctx, *dir, n, a, *emulate, *replicaPort, *runDir, logger)
 	}
 	if err := a.Run(ctx); err != nil {
 		logger.Fatal(err)

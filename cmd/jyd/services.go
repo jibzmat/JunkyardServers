@@ -130,7 +130,7 @@ func storageNodes(a *agent.Agent) []storage.Node {
 }
 
 // startCompute runs this PC's instances, if it has what that takes.
-func startCompute(ctx context.Context, dir string, n *node.Node, a *agent.Agent, emulate bool, replicaPort int, logger *log.Logger) {
+func startCompute(ctx context.Context, dir string, n *node.Node, a *agent.Agent, emulate bool, replicaPort int, runDir string, logger *log.Logger) {
 	q := &compute.QEMU{Emulate: emulate}
 	if err := q.Check(); err != nil {
 		logger.Printf("compute: not running instances: %v", err)
@@ -141,7 +141,7 @@ func startCompute(ctx context.Context, dir string, n *node.Node, a *agent.Agent,
 		return
 	}
 	cdir := filepath.Join(dir, "compute")
-	h := &compute.Host{Control: a.Client(), Driver: q, Dir: cdir, Logger: logger, Metadata: true,
+	h := &compute.Host{Control: a.Client(), Driver: q, Dir: cdir, RunDir: runDir, Logger: logger, Metadata: true,
 		Net: &vnet.Manager{Dir: cdir, Logger: logger}}
 	pool := x509.NewCertPool()
 	pool.AddCert(n.CA)

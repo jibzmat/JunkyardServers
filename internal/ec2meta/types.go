@@ -139,6 +139,9 @@ type Instance struct {
 	// Recovered is set once the instance has moved to its replica: its
 	// root disk must then come from there, never from the image again.
 	Recovered bool `json:"recovered,omitempty"`
+	// MigrateTo asks Host to live-migrate the running instance to this PC,
+	// which is also its replica (so the disks are already there).
+	MigrateTo string `json:"migrate_to,omitempty"`
 
 	// RebootSeq is bumped by RebootInstances; the host reboots the VM when
 	// it sees a value it hasn't acted on.
@@ -324,6 +327,28 @@ type HostView struct {
 	Tasks     []Task     `json:"tasks,omitempty"`
 	// Replicas are the disks this host keeps copies of for other hosts.
 	Replicas []ReplicaDisk `json:"replicas,omitempty"`
+	// Incoming are running instances being live-migrated to this host
+	// (their Host is still the source).
+	Incoming []Instance `json:"incoming,omitempty"`
+}
+
+// MigrationReport is a source host reporting how a live migration ended.
+type MigrationReport struct {
+	Instance string `json:"instance"`
+	To       string `json:"to"`
+	OK       bool   `json:"ok"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// MigrateRequest asks for instances to be live-migrated (an owner's
+// command, not an EC2 one). An empty To lets the control plane choose.
+type MigrateRequest struct {
+	Instance string `json:"instance,omitempty"`
+	To       string `json:"to,omitempty"`
+	// Drain migrates every running instance off this node and stops new
+	// ones landing there (Undrain lifts that).
+	Drain   string `json:"drain,omitempty"`
+	Undrain string `json:"undrain,omitempty"`
 }
 
 // ReplicaDisk is a disk (an instance's root disk, by instance ID, or a

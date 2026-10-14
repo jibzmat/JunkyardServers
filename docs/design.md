@@ -214,7 +214,10 @@ instances reach the internet through NAT.
   failed. Below 0.2 the node is suspended: no new shards, no new
   instances or replicas, and repair moves its shards elsewhere. Suspended
   nodes are still audited and are reinstated at 0.4 (about four passes
-  in a row). `jyctl members` shows each node's record.
+  in a row), or when the owner vouches for them (`jyctl reinstate`, e.g.
+  after replacing a bad disk; a node whose shards have all moved has
+  nothing left to be audited on). `jyctl members` shows each node's
+  record.
 - Quotas: a storage node stores at most `-storage-quota` bytes and always
   leaves 10% of its disk (up to 20 GiB) free; past that its shard server
   answers 507 and writers place the shard on the next node. Shards are
@@ -222,6 +225,45 @@ instances reach the internet through NAT.
   there are k trusted storage PCs every chunk survives all strangers' PCs
   vanishing at once. Repair follows the same order. Chunks written before
   enough trusted PCs existed are not moved yet.
+
+## Scale out (M5)
+
+- Live migration moves a running instance to its replica, which already
+  has its disks in step, so only memory crosses the network:
+  1. The control plane marks the instance `MigrateTo` the replica (an
+     admin's `jyctl migrate`, or `jyctl drain` of its host). A target
+     other than the replica becomes the replica first and the migration
+     waits for the copy.
+  2. The target sees the instance in its host view's `Incoming` list and
+     sets up the VPC. The source opens a "migrate" connection on the
+     replica port (mutual TLS, accepted only from the instance's host),
+     listing the root port each volume is on.
+  3. The target stops serving the copies with qemu-nbd, moves them into
+     place and boots QEMU with the same devices, `-incoming`, and an NBD
+     server exporting the disks it opened. Mirror connections for those
+     disks now go to that server (the source's mirrors reconnect within
+     their 5 s reconnect delay), so guest writes keep reaching both PCs.
+     Disks are opened `share-rw=on` so the export and the guest's device
+     can coexist.
+  4. The source's QEMU streams the VM's memory (auto-converge throttles a
+     guest that dirties memory too fast) over the same connection. At the
+     end the guest pauses on the source; the target finishes loading,
+     the guest runs there, the NBD server stops and the instance's
+     address is routed to the target's tap. The target answers "ok".
+  5. The source reports the move, stops its paused copy and unroutes it;
+     the control plane makes the target the host and picks a new
+     replica. If anything fails before the "ok" the guest resumes on the
+     source, the target goes back to keeping (fresh) copies, and a drain
+     tries again later.
+- A target that doesn't expect the instance yet answers "not ready" and
+  the source keeps asking for up to 2 minutes, since host views reach
+  PCs at different times.
+- Draining marks a member `Drained`: it is not eligible for new instances
+  or replicas, and the scheduler migrates its running instances to their
+  replicas.
+- Measured on two PCs under emulation: 3 to 6 seconds end to end for a
+  1 GiB guest, with the guest's own clock showing under a second of
+  pause.
 
 ## Roadmap
 

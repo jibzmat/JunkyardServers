@@ -71,8 +71,9 @@ type ec2Command struct {
 	Tags      *ec2meta.TagsRequest   `json:"tags,omitempty"`
 	Net       *vpcCommand            `json:"net,omitempty"`
 	// Target is the replica host for set_replica.
-	Target        string                 `json:"target,omitempty"`
-	ReplicaReport *ec2meta.ReplicaReport `json:"replica_report,omitempty"`
+	Target        string                   `json:"target,omitempty"`
+	ReplicaReport *ec2meta.ReplicaReport   `json:"replica_report,omitempty"`
+	Migration     *ec2meta.MigrationReport `json:"migration,omitempty"`
 }
 
 // ec2State is the EC2 part of the replicated state.
@@ -136,6 +137,9 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		return res, err
 	}
 	if res, ok, err := f.applyReplica(c); ok {
+		return res, err
+	}
+	if res, ok, err := f.applyMigration(c); ok {
 		return res, err
 	}
 	switch c.Op {
@@ -837,7 +841,7 @@ func (s *Server) schedulerLoop() {
 
 // eligible reports whether member m may run instance in, ignoring load.
 func (s *Server) eligible(m *cluster.Member, in ec2meta.Instance, emulate bool) bool {
-	if !hasRole(m.Roles, cluster.RoleCompute) || (!m.Hardware.KVM && !emulate) || m.Audits.Suspended {
+	if !hasRole(m.Roles, cluster.RoleCompute) || (!m.Hardware.KVM && !emulate) || m.Audits.Suspended || m.Drained {
 		return false
 	}
 	switch in.Placement {
@@ -978,6 +982,14 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 				}
 			}
 		}
+		for _, in := range st.EC2.Instances {
+			// A running instance migrating here: the host gets ready to
+			// take it.
+			if in.MigrateTo == host && in.Replica == host && in.State == ec2meta.StateRunning {
+				v.Incoming = append(v.Incoming, *in)
+				vpcs[in.VpcID] = true
+			}
+		}
 		for id := range vpcs {
 			if n, ok := vpcNet(st, id, host); ok {
 				v.Networks = append(v.Networks, n)
@@ -997,6 +1009,7 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 	})
 	sort.Slice(v.Networks, func(i, j int) bool { return v.Networks[i].VPC.ID < v.Networks[j].VPC.ID })
 	sort.Slice(v.Volumes, func(i, j int) bool { return v.Volumes[i].ID < v.Volumes[j].ID })
+	sort.Slice(v.Incoming, func(i, j int) bool { return v.Incoming[i].ID < v.Incoming[j].ID })
 	sort.Slice(v.Tasks, func(i, j int) bool { return v.Tasks[i].ID < v.Tasks[j].ID })
 	sort.Slice(v.Instances, func(i, j int) bool { return v.Instances[i].ID < v.Instances[j].ID })
 	return v
@@ -1072,6 +1085,8 @@ func (s *Server) ec2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/ec2/host/console", host(s.leaderOnly(s.handleHostConsole)))
 	mux.HandleFunc("POST /v1/ec2/host/report", host(s.leaderOnly(s.handleHostReport)))
 	mux.HandleFunc("POST /v1/ec2/host/replica-report", host(s.leaderOnly(s.handleReplicaReport)))
+	mux.HandleFunc("POST /v1/ec2/host/migrated", host(s.leaderOnly(s.handleMigrated)))
+	mux.HandleFunc("POST /v1/admin/migrate", s.requireKind(s.leaderOnly(s.handleMigrate), pki.KindAdmin))
 	mux.HandleFunc("GET /v1/ec2/host/images/{id}", host(s.handleHostImage))
 }
 

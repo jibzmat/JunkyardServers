@@ -62,6 +62,19 @@ func TestAuditsSuspendAndReinstate(t *testing.T) {
 	if !c.srv.eligible(&m, ec2Any(), true) {
 		t.Fatal("reinstated PC still can't run instances")
 	}
+	// The owner can vouch for a suspended node.
+	for !member().Audits.Suspended {
+		record(false)
+	}
+	if err := c.srv.Reinstate(member().NodeID); err != nil {
+		t.Fatal(err)
+	}
+	if m := member(); m.Audits.Suspended || m.Audits.Score < reinstateAt {
+		t.Fatalf("after reinstating: %+v", m.Audits)
+	}
+	if err := c.srv.Reinstate("n-nobody"); err == nil {
+		t.Fatal("reinstated an unknown node")
+	}
 	// Unknown nodes are ignored.
 	if err := c.srv.RecordAudits([]storage.AuditResult{{Node: "n-nobody", OK: false}}); err != nil {
 		t.Fatal(err)

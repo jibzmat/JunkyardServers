@@ -248,6 +248,25 @@ func (c *Client) ReportReplica(ctx context.Context, r ec2meta.ReplicaReport) err
 	return c.call(ctx, http.MethodPost, "/v1/ec2/host/replica-report", r, &out)
 }
 
+// ReportMigration tells the control plane how a live migration ended.
+func (c *Client) ReportMigration(ctx context.Context, r ec2meta.MigrationReport) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/host/migrated", r, &out)
+}
+
+// Migrate live-migrates an instance, or drains or undrains a PC (admin).
+func (c *Client) Migrate(ctx context.Context, req ec2meta.MigrateRequest) (*ec2meta.Instance, error) {
+	var out *ec2meta.Instance
+	err := c.call(ctx, http.MethodPost, "/v1/admin/migrate", req, &out)
+	return out, err
+}
+
+// Reinstate lifts a storage node's suspension (admin).
+func (c *Client) Reinstate(ctx context.Context, node string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/admin/reinstate", map[string]string{"node": node}, &out)
+}
+
 // FailTask reports a task the host couldn't do.
 func (c *Client) FailTask(ctx context.Context, f ec2meta.TaskFailure) error {
 	var out struct{}

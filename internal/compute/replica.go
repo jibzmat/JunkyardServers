@@ -38,8 +38,14 @@ const mirrorBehindLimit = 30 * time.Second
 // the replica can create its copy.
 type replicaHello struct {
 	Disk string `json:"disk"`
-	Size int64  `json:"size"`
+	Size int64  `json:"size,omitempty"`
+	// Kind is empty for a mirror, or helloMigrate to send the instance
+	// Disk itself (migrate.go), its volumes on Ports.
+	Kind  string            `json:"kind,omitempty"`
+	Ports map[string]string `json:"ports,omitempty"`
 }
+
+const helloMigrate = "migrate"
 
 func (h *Host) runDir() string {
 	if h.RunDir != "" {
@@ -488,7 +494,15 @@ func (h *Host) serveReplica(c net.Conn, peer func(net.Conn) (string, error)) {
 	refuse := func(format string, args ...any) {
 		fmt.Fprintf(c, format+"\n", args...)
 	}
-	if err := json.Unmarshal(line, &hello); err != nil || !validDisk(hello.Disk) || hello.Size <= 0 {
+	if err := json.Unmarshal(line, &hello); err != nil || !validDisk(hello.Disk) {
+		refuse("bad request")
+		return
+	}
+	if hello.Kind == helloMigrate && strings.HasPrefix(hello.Disk, "i-") {
+		h.receiveVM(c, br, node, hello)
+		return
+	}
+	if hello.Kind != "" || hello.Size <= 0 {
 		refuse("bad request")
 		return
 	}
@@ -503,6 +517,20 @@ func (h *Host) serveReplica(c net.Conn, peer func(net.Conn) (string, error)) {
 	h.dropConn(hello.Disk)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+	h.mu.Lock()
+	nbdSock := h.migrating[hello.Disk]
+	h.mu.Unlock()
+	if nbdSock != "" {
+		// The instance is migrating here: its mirror now writes to the
+		// incoming QEMU, which has the copy open.
+		nbd, err := net.DialTimeout("unix", nbdSock, 5*time.Second)
+		if err != nil {
+			refuse("cannot serve the copy")
+			return
+		}
+		h.spliceReplica(c, br, hello.Disk, nbd)
+		return
+	}
 	sock := h.exportSocket(hello.Disk)
 	if err := os.MkdirAll(filepath.Dir(h.replicaPath(hello.Disk)), 0o700); err != nil {
 		refuse("%v", err)
@@ -512,7 +540,7 @@ func (h *Host) serveReplica(c net.Conn, peer func(net.Conn) (string, error)) {
 		refuse("%v", err)
 		return
 	}
-	if err := h.Driver.Export(ctx, h.replicaPath(hello.Disk), hello.Size, sock); err != nil {
+	if err := h.Driver.Export(ctx, h.replicaPath(hello.Disk), hello.Disk, hello.Size, sock); err != nil {
 		h.logf("compute: serving the copy of %s: %v", hello.Disk, err)
 		refuse("cannot serve the copy")
 		return
@@ -522,6 +550,12 @@ func (h *Host) serveReplica(c net.Conn, peer func(net.Conn) (string, error)) {
 		refuse("cannot serve the copy")
 		return
 	}
+	h.spliceReplica(c, br, hello.Disk, nbd)
+}
+
+// spliceReplica accepts a mirror connection and carries it to the NBD
+// server nbd.
+func (h *Host) spliceReplica(c net.Conn, br *bufio.Reader, disk string, nbd net.Conn) {
 	if _, err := io.WriteString(c, "ok\n"); err != nil {
 		nbd.Close()
 		return
@@ -531,12 +565,12 @@ func (h *Host) serveReplica(c net.Conn, peer func(net.Conn) (string, error)) {
 	if h.replicaConns == nil {
 		h.replicaConns = map[string]net.Conn{}
 	}
-	h.replicaConns[hello.Disk] = c
+	h.replicaConns[disk] = c
 	h.mu.Unlock()
 	splice(bufConn{c, br}, nbd)
 	h.mu.Lock()
-	if h.replicaConns[hello.Disk] == c {
-		delete(h.replicaConns, hello.Disk)
+	if h.replicaConns[disk] == c {
+		delete(h.replicaConns, disk)
 	}
 	h.mu.Unlock()
 }

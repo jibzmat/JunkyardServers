@@ -20,6 +20,7 @@ import (
 	"github.com/jibzmat/JunkyardServers/internal/agent"
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
 	"github.com/jibzmat/JunkyardServers/internal/control"
+	"github.com/jibzmat/JunkyardServers/internal/ec2meta"
 	"github.com/jibzmat/JunkyardServers/internal/hw"
 	"github.com/jibzmat/JunkyardServers/internal/mesh"
 	"github.com/jibzmat/JunkyardServers/internal/node"
@@ -37,6 +38,10 @@ Commands:
   control   add or remove control nodes (control add | control list | control remove <id>)
   wg-config print this node's WireGuard config in wg-quick format
   tenant    create an S3 tenant and its access key (tenant create <name>)
+  migrate   live-migrate a running instance to another PC (migrate [-to NODE] <instance-id>)
+  drain     move every instance off a PC, live, and give it no new ones (drain <node>)
+  undrain   let a drained PC take instances again (undrain <node>)
+  reinstate lift a node's suspension for failed storage audits (reinstate <node>)
 
 Run "jyctl <command> -h" for flags.
 `
@@ -62,6 +67,10 @@ func main() {
 		err = cmdWGConfig(os.Args[2:])
 	case "tenant":
 		err = cmdTenant(os.Args[2:])
+	case "migrate":
+		err = cmdMigrate(os.Args[2:])
+	case "drain", "undrain", "reinstate":
+		err = cmdDrain(os.Args[1], os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -251,7 +260,11 @@ func cmdMembers(args []string) error {
 		if m.StoragePort != 0 {
 			port = strconv.Itoa(m.StoragePort)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\t%d\t%s\t%v\t%s\n", m.NodeID, m.MeshIP, m.Tier, m.Roles, port,
+		tier := string(m.Tier)
+		if m.Drained {
+			tier += " (drained)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\t%d\t%s\t%v\t%s\n", m.NodeID, m.MeshIP, tier, m.Roles, port,
 			m.Hardware.Cores, gib(m.Hardware.MemBytes), m.Hardware.Confidential(), audits(m.Audits))
 	}
 	return tw.Flush()
@@ -393,6 +406,65 @@ func cmdTenant(args []string) error {
 	fmt.Println("Use them with any S3 client pointed at a gateway, for example:")
 	fmt.Println("  aws --endpoint-url http://<gateway>:9000 s3 ls")
 	return nil
+}
+
+func cmdMigrate(args []string) error {
+	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
+	dir := fs.String("dir", defaultDir(), "state directory with admin.crt")
+	to := fs.String("to", "", "PC to move to (default: the instance's replica PC, which already has its disks)")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("migrate: usage: jyctl migrate [-to NODE] <instance-id>")
+	}
+	c, err := adminClient(*dir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	in, err := c.Migrate(ctx, ec2meta.MigrateRequest{Instance: fs.Arg(0), To: *to})
+	if err != nil {
+		return err
+	}
+	if in.Replica == in.MigrateTo && in.ReplicaSynced {
+		fmt.Printf("Migrating %s from %s to %s.\n", in.ID, in.Host, in.MigrateTo)
+	} else {
+		fmt.Printf("Copying %s's disks to %s; it migrates there from %s once the copy is in step.\n", in.ID, in.MigrateTo, in.Host)
+	}
+	return nil
+}
+
+func cmdDrain(cmd string, args []string) error {
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	dir := fs.String("dir", defaultDir(), "state directory with admin.crt")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("%s: usage: jyctl %s <node>", cmd, cmd)
+	}
+	c, err := adminClient(*dir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	switch cmd {
+	case "drain":
+		_, err = c.Migrate(ctx, ec2meta.MigrateRequest{Drain: fs.Arg(0)})
+		if err == nil {
+			fmt.Printf("Draining %s: its running instances migrate to their replica PCs.\n", fs.Arg(0))
+		}
+	case "undrain":
+		_, err = c.Migrate(ctx, ec2meta.MigrateRequest{Undrain: fs.Arg(0)})
+		if err == nil {
+			fmt.Printf("%s takes instances again.\n", fs.Arg(0))
+		}
+	case "reinstate":
+		err = c.Reinstate(ctx, fs.Arg(0))
+		if err == nil {
+			fmt.Printf("%s is reinstated, on probation: a failed audit suspends it again.\n", fs.Arg(0))
+		}
+	}
+	return err
 }
 
 // raftAddrFor puts the Raft port on the API address's host.

@@ -182,12 +182,27 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
 - Proof of storage: every storage PC is asked for a random shard it should
   hold every 10 minutes and must send it back intact. PCs that keep
   failing are suspended (no new data or instances, their shards rebuilt
-  elsewhere) until passing audits restore their score. `jyctl members`
-  shows each PC's audits.
+  elsewhere) until passing audits restore their score, or you vouch for
+  one with `jyctl reinstate <node>`. `jyctl members` shows each PC's
+  audits.
 - Quotas: `jyd -storage-quota 500G` caps what a PC stores, and every PC
   keeps 10% of its disk (up to 20 GiB) free. New shards go to your own
   PCs first, so with enough of them every chunk can be read even if all
   strangers' PCs disappear at once.
+
+## What M5 adds so far: live migration
+
+- `jyctl migrate <instance-id>` moves a running instance to its second PC
+  (the one holding the live copy of its disks) without stopping it: the
+  guest keeps its uptime, memory, open connections and address, and
+  pauses for well under a second at the end. `-to <node>` picks another
+  PC; its disks are copied there first.
+- `jyctl drain <node>` moves every running instance off a PC that way and
+  gives it no new instances or copies, say before you shut it down;
+  `jyctl undrain <node>` undoes it.
+- The two PCs need compatible CPUs (guests run with the host's CPU
+  model).
+- Still to come in M5: cluster instances, a NAT gateway and elastic IPs.
 
 ## Try it
 
@@ -263,6 +278,12 @@ M2:
 - Public IPs and a way in from outside the VPC (M5).
 - Spot, launch templates, IAM instance profiles (the metadata service has
   no credentials to hand out yet).
+
+M5:
+
+- A migration that can't finish (a guest dirtying memory faster than the
+  network carries it, even slowed down) gives up after 30 minutes.
+- The console output from before a migration stays on the old PC.
 
 M4:
 

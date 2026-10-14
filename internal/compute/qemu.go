@@ -148,6 +148,11 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 	if q.Running(vm) {
 		return nil
 	}
+	return q.launch(ctx, vm)
+}
+
+// launch runs QEMU for a prepared instance, with extra arguments.
+func (q *QEMU) launch(ctx context.Context, vm *VM, extra ...string) error {
 	// The tap is made in the VPC's namespace, and QEMU runs there to open
 	// it; the host then routes it (vnet.Manager.Plug).
 	t := vnet.TapName(vm.Instance.ID)
@@ -171,7 +176,7 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 		"-smp", strconv.Itoa(in.VCPU), "-m", strconv.Itoa(in.MemMiB),
 		// The root disk is a named node so it can be mirrored.
 		"-blockdev", "driver=qcow2,node-name=" + rootNode + ",file.driver=file,file.filename=" + absPath(filepath.Join(vm.Dir, "disk.qcow2")),
-		"-device", "virtio-blk-pci,drive=" + rootNode + ",bootindex=0",
+		"-device", "virtio-blk-pci,drive=" + rootNode + ",bootindex=0,share-rw=on",
 		"-drive", "file=" + filepath.Join(vm.Dir, "seed.iso") + ",if=virtio,format=raw,readonly=on",
 		"-netdev", "tap,id=n0,ifname=" + t + ",script=no,downscript=no",
 		"-device", "virtio-net-pci,netdev=n0,mac=" + in.MAC,
@@ -191,10 +196,15 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 		return fmt.Errorf("compute: at most %d volumes per instance", rootPorts)
 	}
 	for i, d := range vm.Disks {
+		bus := d.Bus
+		if bus == "" {
+			bus = fmt.Sprintf("rp%d", i+1)
+		}
 		args = append(args,
 			"-blockdev", "driver=qcow2,node-name="+nodeName(d.ID)+",file.driver=file,file.filename="+d.Path,
-			"-device", volumeDevice(d.ID)+",bus="+fmt.Sprintf("rp%d", i+1)+",addr=0")
+			"-device", volumeDevice(d.ID)+",bus="+bus+",addr=0")
 	}
+	args = append(args, extra...)
 	return run(ctx, "ip", append([]string{"netns", "exec", vm.NetNS, q.binary()}, args...)...)
 }
 
@@ -225,11 +235,14 @@ func absPath(p string) string {
 }
 func deviceID(vol string) string { return "v-" + vol }
 
+// Disks are shared for writing (share-rw) so that, while an instance
+// migrates in, the NBD server its mirrors write to can hold the disks too.
+
 // volumeDevice is the virtio disk for a volume. Its serial is the volume
 // ID without the dash (20 characters, virtio's limit), as on EC2's NVMe
 // volumes, so the guest finds it at /dev/disk/by-id/virtio-vol....
 func volumeDevice(vol string) string {
-	return "virtio-blk-pci,drive=" + nodeName(vol) + ",id=" + deviceID(vol) + ",serial=" + strings.Replace(vol, "-", "", 1)
+	return "virtio-blk-pci,drive=" + nodeName(vol) + ",id=" + deviceID(vol) + ",serial=" + strings.Replace(vol, "-", "", 1) + ",share-rw=on"
 }
 
 // CreateDisk makes a volume's qcow2: blank, or a copy of from (a
@@ -280,7 +293,7 @@ func (q *QEMU) Attach(ctx context.Context, vm *VM, d Disk) error {
 	for i := 1; i <= rootPorts; i++ {
 		_, err = qmpRun(vm, qmpCmd{"device_add", map[string]any{
 			"driver": "virtio-blk-pci", "drive": nodeName(d.ID), "id": deviceID(d.ID),
-			"serial": strings.Replace(d.ID, "-", "", 1), "bus": fmt.Sprintf("rp%d", i),
+			"serial": strings.Replace(d.ID, "-", "", 1), "bus": fmt.Sprintf("rp%d", i), "share-rw": true,
 			// A root port has one slot the guest scans; without this QEMU
 			// would put a second device on a busy port where it's unseen.
 			"addr": "0",
@@ -535,7 +548,7 @@ func (q *QEMU) StartMirror(ctx context.Context, vm *VM, disk, socket string) err
 	_, _ = qmpRun(vm, qmpCmd{"blockdev-del", map[string]any{"node-name": mirrorNode(disk)}}) // left from a failed job
 	_, err := qmpRun(vm,
 		qmpCmd{"blockdev-add", map[string]any{
-			"driver": "nbd", "node-name": mirrorNode(disk), "export": "d",
+			"driver": "nbd", "node-name": mirrorNode(disk), "export": disk,
 			"server": map[string]any{"type": "unix", "path": socket},
 			// A request waits this long for a lost connection to come
 			// back before failing (and the mirror with it).
@@ -595,7 +608,7 @@ func (q *QEMU) DiskSize(ctx context.Context, path string) (int64, error) {
 }
 
 // Export serves a disk copy with qemu-nbd, a daemon that outlives jyd.
-func (q *QEMU) Export(ctx context.Context, path string, size int64, socket string) error {
+func (q *QEMU) Export(ctx context.Context, path, name string, size int64, socket string) error {
 	if _, ok := nbdPID(socket); ok {
 		return nil
 	}
@@ -616,7 +629,7 @@ func (q *QEMU) Export(ctx context.Context, path string, size int64, socket strin
 	}
 	os.Remove(socket)
 	if err := run(ctx, "qemu-nbd", "--fork", "--pid-file", socket+".pid", "--persistent",
-		"-f", "qcow2", "-x", "d", "-k", socket, path); err != nil {
+		"-f", "qcow2", "-x", name, "-k", socket, path); err != nil {
 		return err
 	}
 	return nil
