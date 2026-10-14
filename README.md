@@ -52,7 +52,7 @@ sudo bin/jyctl members
 
 # Make PC 2 a control node too (it must have joined with a -trusted token)
 sudo bin/jyctl control add -api 192.168.1.11:7443
-sudo systemctl restart jyd   # or restart jyd by hand
+# then restart jyd on PC 2
 sudo bin/jyctl control list
 ```
 
