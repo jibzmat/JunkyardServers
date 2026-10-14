@@ -31,7 +31,8 @@ const (
 type Config struct {
 	NodeID     string         `json:"node_id"`
 	Cluster    string         `json:"cluster"`
-	Control    string         `json:"control"` // control plane host:port
+	Control    string         `json:"control"`            // control plane host:port used to join
+	Controls   []string       `json:"controls,omitempty"` // every control node's API address
 	Tier       cluster.Tier   `json:"tier"`
 	Roles      []cluster.Role `json:"roles"`
 	MeshIP     string         `json:"mesh_ip"`
@@ -41,6 +42,17 @@ type Config struct {
 	WGPort     int            `json:"wg_port"`
 	WGEndpoint string         `json:"wg_endpoint,omitempty"` // public host:port, if reachable
 	Seeds      []string       `json:"seeds"`                 // gossip addresses known at join
+}
+
+// ControlAddrs returns the control plane addresses to try, in order.
+func (c Config) ControlAddrs() []string {
+	out := append([]string(nil), c.Controls...)
+	for _, a := range out {
+		if a == c.Control {
+			return out
+		}
+	}
+	return append(out, c.Control)
 }
 
 // Keys are a node's private keys, generated before it joins.

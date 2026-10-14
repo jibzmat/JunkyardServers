@@ -21,21 +21,23 @@ type testCluster struct {
 	srv   *Server
 	admin *Client
 	addr  string
+	creds *AdminCredentials
 }
 
-func newTestCluster(t *testing.T) *testCluster {
+func freeAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
-	dir := filepath.Join(t.TempDir(), "control")
-	creds, err := Init(dir, "test", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv, err := Open(dir)
+	defer ln.Close()
+	return ln.Addr().String()
+}
+
+// serve starts the API for srv on its API address.
+func serve(t *testing.T, srv *Server) {
+	t.Helper()
+	ln, err := net.Listen("tcp", srv.APIAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,9 +47,20 @@ func newTestCluster(t *testing.T) *testCluster {
 	ts.TLS = srv.TLSConfig()
 	ts.StartTLS()
 	t.Cleanup(ts.Close)
+}
 
+func newTestCluster(t *testing.T) *testCluster {
+	t.Helper()
+	addr := freeAddr(t)
+	dir := filepath.Join(t.TempDir(), "control")
+	srv, creds, err := Init(dir, "test", addr, freeAddr(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	serve(t, srv)
 	adminCert := pki.TLSCertificate(creds.CertDER, creds.Key, srv.CA())
-	return &testCluster{srv: srv, admin: NewClient(addr, adminCert, srv.CA()), addr: addr}
+	return &testCluster{srv: srv, admin: NewClient([]string{addr}, adminCert, srv.CA()), addr: addr, creds: creds}
 }
 
 func joinReq(t *testing.T, roles ...cluster.Role) (cluster.JoinRequest, *node.Keys) {
@@ -171,7 +184,7 @@ func TestMembersAndAccessControl(t *testing.T) {
 	}
 
 	cert, _ := pki.ParseCertPEM(lastResp.CertPEM)
-	nodeClient := NewClient(c.addr, pki.TLSCertificate(cert.Raw, lastKeys.Signing, c.srv.CA()), c.srv.CA())
+	nodeClient := NewClient([]string{c.addr}, pki.TLSCertificate(cert.Raw, lastKeys.Signing, c.srv.CA()), c.srv.CA())
 	members, err := nodeClient.Members(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +199,7 @@ func TestMembersAndAccessControl(t *testing.T) {
 	}
 
 	// No client certificate: members is refused.
-	anon := NewClient(c.addr, tls.Certificate{}, c.srv.CA())
+	anon := NewClient([]string{c.addr}, tls.Certificate{}, c.srv.CA())
 	if _, err := anon.Members(context.Background()); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("anonymous members: %v", err)
 	}
@@ -198,12 +211,25 @@ func TestStateSurvivesReopen(t *testing.T) {
 	if _, err := Join(context.Background(), c.token(t, false), req); err != nil {
 		t.Fatal(err)
 	}
-	again, err := Open(c.srv.dir)
+	dir := c.srv.dir
+	if err := c.srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(again.Members()); n != 1 {
-		t.Fatalf("members after reopen = %d", n)
+	defer again.Close()
+	if err := again.waitLeader(10 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// Raft replays the log into the state machine after restart.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(again.Members()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("members after reopen = %d", len(again.Members()))
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

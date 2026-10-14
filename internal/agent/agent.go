@@ -54,7 +54,7 @@ func New(n *node.Node, opts Options) *Agent {
 	}
 	return &Agent{
 		node:   n,
-		client: control.NewClient(n.Config.Control, n.TLSCertificate(), n.CA),
+		client: control.NewClient(n.Config.ControlAddrs(), n.TLSCertificate(), n.CA),
 		opts:   opts,
 		log:    lg,
 		kick:   make(chan struct{}, 1),
@@ -113,6 +113,14 @@ func (a *Agent) trigger() {
 func (a *Agent) refresh(ctx context.Context) {
 	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	// Pick up control nodes added or removed since this node joined.
+	if controls, err := a.client.Controls(rctx); err == nil && len(controls) > 0 {
+		addrs := make([]string, 0, len(controls))
+		for _, c := range controls {
+			addrs = append(addrs, c.APIAddr)
+		}
+		a.client = control.NewClient(addrs, a.node.TLSCertificate(), a.node.CA)
+	}
 	members, err := a.client.Members(rctx)
 	if err != nil {
 		a.log.Printf("registry: %v", err)

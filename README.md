@@ -26,6 +26,10 @@ This repository is at **milestone M0: mesh and cluster bootstrap**. See
   a WireGuard interface (`jy0`, `100.64.0.0/10`) in sync with every other node.
 - `jyctl members` and `jyctl wg-config` show the cluster and this node's mesh
   config.
+- The control plane is replicated with Raft (over mutual TLS) across any of
+  your trusted PCs: `jyctl control add` turns one into a control node. Any
+  control node answers reads and redirects writes to the leader, and nodes
+  fail over between control addresses on their own.
 
 ## Try it
 
@@ -45,7 +49,15 @@ sudo bin/jyctl token -trusted   # one of your own PCs
 sudo bin/jyctl join 'jy1.…'
 sudo bin/jyd &
 sudo bin/jyctl members
+
+# Make PC 2 a control node too (it must have joined with a -trusted token)
+sudo bin/jyctl control add -api 192.168.1.11:7443
+sudo systemctl restart jyd   # or restart jyd by hand
+sudo bin/jyctl control list
 ```
+
+Run 3 or 5 control nodes: Raft needs a majority alive, so 2 control nodes
+tolerate no failures and 3 tolerate one.
 
 `jyd -wireguard=false` skips the kernel interface (useful for testing without
 root); `jyctl wg-config` prints the config that would be applied.
@@ -77,8 +89,8 @@ go vet ./... && go test -race ./...
 
 ## Not yet in M0
 
-- The control plane is a single PC with a JSON state file; the 3-5 node Raft
-  group comes next.
+- Control nodes are added by hand; automatic placement across healthy
+  trusted PCs (the decentralized control plane) comes later.
 - NAT traversal and relays for PCs that can't reach each other directly.
 - Certificate rotation and revocation.
 

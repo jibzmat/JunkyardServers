@@ -56,7 +56,8 @@ the control plane registry.
 - M1 includes a gateway-side encrypted listing index for large buckets.
 - A fully decentralized control plane is the goal: metadata split into many
   small Raft groups whose members are picked automatically from healthy
-  owner-trusted PCs. M0's single control PC is a stepping stone. Strangers'
+  owner-trusted PCs. M0 replicates the control plane with Raft across control
+  nodes you add with `jyctl control add`; automatic placement comes later. Strangers'
   PCs without SEV-SNP/TDX never hold metadata keys or CA signing power.
 - License: AGPL-3.0, so MinIO code (also AGPL-3.0) can be reused with
   attribution.

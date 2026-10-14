@@ -36,7 +36,6 @@ func Join(ctx context.Context, tok token.Token, req cluster.JoinRequest) (*clust
 	if err := do(ctx, newHTTPClient(cfg), http.MethodPost, "https://"+tok.Control+"/v1/join", req, &resp); err != nil {
 		return nil, err
 	}
-	// The returned CA must be the one we pinned.
 	caCert, err := pki.ParseCertPEM(resp.CAPEM)
 	if err != nil {
 		return nil, err
@@ -70,14 +69,15 @@ func verifyPinned(chain []*x509.Certificate, fingerprint string) error {
 	return nil
 }
 
-// Client talks to the control plane with a cluster certificate.
+// Client talks to the control plane with a cluster certificate. It tries each
+// control address in turn, and follows redirects to the leader.
 type Client struct {
-	addr string
-	http *http.Client
+	addrs []string
+	http  *http.Client
 }
 
 // NewClient builds a client that presents cert and trusts only caCert.
-func NewClient(addr string, cert tls.Certificate, caCert *x509.Certificate) *Client {
+func NewClient(addrs []string, cert tls.Certificate, caCert *x509.Certificate) *Client {
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
 	cfg := &tls.Config{
@@ -85,21 +85,72 @@ func NewClient(addr string, cert tls.Certificate, caCert *x509.Certificate) *Cli
 		RootCAs:      pool,
 		Certificates: []tls.Certificate{cert},
 	}
-	return &Client{addr: addr, http: newHTTPClient(cfg)}
+	return &Client{addrs: addrs, http: newHTTPClient(cfg)}
 }
 
 // Members lists the cluster's nodes.
 func (c *Client) Members(ctx context.Context) ([]cluster.Member, error) {
 	var out []cluster.Member
-	err := do(ctx, c.http, http.MethodGet, "https://"+c.addr+"/v1/members", nil, &out)
+	err := c.call(ctx, http.MethodGet, "/v1/members", nil, &out)
+	return out, err
+}
+
+// Controls lists the control nodes.
+func (c *Client) Controls(ctx context.Context) ([]ControlInfo, error) {
+	var out []ControlInfo
+	err := c.call(ctx, http.MethodGet, "/v1/controls", nil, &out)
 	return out, err
 }
 
 // IssueToken asks for a join token (admin certificate required).
 func (c *Client) IssueToken(ctx context.Context, req cluster.TokenRequest) (string, error) {
 	var out cluster.TokenResponse
-	err := do(ctx, c.http, http.MethodPost, "https://"+c.addr+"/v1/tokens", req, &out)
+	err := c.call(ctx, http.MethodPost, "/v1/tokens", req, &out)
 	return out.Token, err
+}
+
+// EnrollControl asks to become a control node (node certificate required).
+func (c *Client) EnrollControl(ctx context.Context, req cluster.ControlEnrollRequest) (*cluster.ControlEnrollResponse, error) {
+	var out cluster.ControlEnrollResponse
+	if err := c.call(ctx, http.MethodPost, "/v1/controls/enroll", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ActivateControl asks the leader to add the caller to the Raft group
+// (control certificate required).
+func (c *Client) ActivateControl(ctx context.Context) error {
+	var out map[string]string
+	return c.call(ctx, http.MethodPost, "/v1/controls/activate", struct{}{}, &out)
+}
+
+// RemoveControl removes a control node (admin certificate required).
+func (c *Client) RemoveControl(ctx context.Context, id string) error {
+	var out map[string]string
+	return c.call(ctx, http.MethodDelete, "/v1/controls/"+id, nil, &out)
+}
+
+// call tries each address until one answers. A refusal from a reachable
+// control node (4xx) is returned at once; only transport failures and 503s
+// move on to the next address.
+func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
+	if len(c.addrs) == 0 {
+		return errors.New("control: no control plane address")
+	}
+	var errs []error
+	for _, a := range c.addrs {
+		err := do(ctx, c.http, method, "https://"+a+path, in, out)
+		if err == nil {
+			return nil
+		}
+		var he *httpErr
+		if errors.As(err, &he) && he.code != http.StatusServiceUnavailable {
+			return err
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func newHTTPClient(cfg *tls.Config) *http.Client {
@@ -109,16 +160,28 @@ func newHTTPClient(cfg *tls.Config) *http.Client {
 	}
 }
 
+type httpErr struct {
+	code int
+	msg  string
+}
+
+func (e *httpErr) Error() string {
+	if e.msg != "" {
+		return fmt.Sprintf("control: %s (%d)", e.msg, e.code)
+	}
+	return fmt.Sprintf("control: HTTP %d", e.code)
+}
+
 func do(ctx context.Context, hc *http.Client, method, url string, in, out any) error {
-	var body io.Reader
+	var body []byte
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
 			return err
 		}
-		body = bytes.NewReader(b)
+		body = b
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -138,10 +201,8 @@ func do(ctx context.Context, hc *http.Client, method, url string, in, out any) e
 		var e struct {
 			Error string `json:"error"`
 		}
-		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("control: %s (%d)", e.Error, resp.StatusCode)
-		}
-		return fmt.Errorf("control: HTTP %d", resp.StatusCode)
+		_ = json.Unmarshal(data, &e)
+		return &httpErr{code: resp.StatusCode, msg: e.Error}
 	}
 	return json.Unmarshal(data, out)
 }

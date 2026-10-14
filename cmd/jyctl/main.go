@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -32,6 +34,7 @@ Commands:
   token     issue a join token (run on the PC that ran init)
   join      join this PC to a cluster with a token
   members   list the cluster's nodes
+  control   add or remove control nodes (control add | control list | control remove <id>)
   wg-config print this node's WireGuard config in wg-quick format
 
 Run "jyctl <command> -h" for flags.
@@ -52,6 +55,8 @@ func main() {
 		err = cmdJoin(os.Args[2:])
 	case "members":
 		err = cmdMembers(os.Args[2:])
+	case "control":
+		err = cmdControl(os.Args[2:])
 	case "wg-config":
 		err = cmdWGConfig(os.Args[2:])
 	case "-h", "--help", "help":
@@ -79,6 +84,7 @@ func cmdInit(args []string) error {
 	name := fs.String("cluster", "junkyard", "cluster name")
 	addr := fs.String("control", "", "control plane address other PCs can reach, host:port (required)")
 	gossip := fs.String("gossip", ":7946", "gossip listen address")
+	raftPort := fs.Int("raft-port", 7444, "Raft port for control-plane replication")
 	wgPort := fs.Int("wg-port", 51820, "WireGuard listen port")
 	wgEndpoint := fs.String("wg-endpoint", "", "public WireGuard host:port, if this PC is reachable from outside")
 	roles := fs.String("roles", "control,gateway,compute,storage", "roles for this PC")
@@ -92,10 +98,11 @@ func cmdInit(args []string) error {
 	}
 
 	controlDir := filepath.Join(*dir, "control")
-	admin, err := control.Init(controlDir, *name, *addr)
+	srv, admin, err := control.Init(controlDir, *name, *addr, raftAddrFor(*addr, *raftPort), nil)
 	if err != nil {
 		return err
 	}
+	defer srv.Close()
 	if err := pki.WriteCertPEM(filepath.Join(*dir, "admin.crt"), admin.CertDER); err != nil {
 		return err
 	}
@@ -103,10 +110,6 @@ func cmdInit(args []string) error {
 		return err
 	}
 
-	srv, err := control.Open(controlDir)
-	if err != nil {
-		return err
-	}
 	keys, err := node.NewKeys()
 	if err != nil {
 		return err
@@ -225,7 +228,7 @@ func cmdMembers(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := control.NewClient(n.Config.Control, n.TLSCertificate(), n.CA)
+	c := control.NewClient(n.Config.ControlAddrs(), n.TLSCertificate(), n.CA)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	members, err := c.Members(ctx)
@@ -249,7 +252,7 @@ func cmdWGConfig(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := control.NewClient(n.Config.Control, n.TLSCertificate(), n.CA)
+	c := control.NewClient(n.Config.ControlAddrs(), n.TLSCertificate(), n.CA)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	members, err := c.Members(ctx)
@@ -267,6 +270,88 @@ func cmdWGConfig(args []string) error {
 	return nil
 }
 
+func cmdControl(args []string) error {
+	if len(args) == 0 {
+		return errors.New("control: usage: jyctl control add|list|remove")
+	}
+	switch args[0] {
+	case "add":
+		fs := flag.NewFlagSet("control add", flag.ExitOnError)
+		dir := fs.String("dir", defaultDir(), "state directory of this (owner-trusted) node")
+		api := fs.String("api", "", "API address other PCs can reach, host:port (required)")
+		raftPort := fs.Int("raft-port", 7444, "Raft port")
+		fs.Parse(args[1:])
+		if *api == "" {
+			return errors.New("control add: -api is required (for example 192.168.1.11:7443)")
+		}
+		n, err := node.Load(*dir)
+		if err != nil {
+			return err
+		}
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return err
+		}
+		c := control.NewClient(n.Config.ControlAddrs(), n.TLSCertificate(), n.CA)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		resp, err := c.EnrollControl(ctx, cluster.ControlEnrollRequest{PublicKey: pub, APIAddr: *api, RaftAddr: raftAddrFor(*api, *raftPort)})
+		if err != nil {
+			return err
+		}
+		if err := control.WriteEnrollment(filepath.Join(*dir, "control"), resp, priv); err != nil {
+			return err
+		}
+		fmt.Printf("Enrolled as control node %s. Restart jyd -dir %s to join the Raft group.\n", resp.ID, *dir)
+		return nil
+	case "list":
+		fs := flag.NewFlagSet("control list", flag.ExitOnError)
+		dir := fs.String("dir", defaultDir(), "state directory")
+		fs.Parse(args[1:])
+		n, err := node.Load(*dir)
+		if err != nil {
+			return err
+		}
+		c := control.NewClient(n.Config.ControlAddrs(), n.TLSCertificate(), n.CA)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		controls, err := c.Controls(ctx)
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "CONTROL\tAPI\tRAFT")
+		for _, ci := range controls {
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", ci.ID, ci.APIAddr, ci.RaftAddr)
+		}
+		return tw.Flush()
+	case "remove":
+		fs := flag.NewFlagSet("control remove", flag.ExitOnError)
+		dir := fs.String("dir", defaultDir(), "state directory with admin.crt")
+		fs.Parse(args[1:])
+		if fs.NArg() != 1 {
+			return errors.New("control remove: usage: jyctl control remove [flags] <control-id>")
+		}
+		c, err := adminClient(*dir)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return c.RemoveControl(ctx, fs.Arg(0))
+	}
+	return fmt.Errorf("control: unknown subcommand %q", args[0])
+}
+
+// raftAddrFor puts the Raft port on the API address's host.
+func raftAddrFor(apiAddr string, port int) string {
+	host, _, err := net.SplitHostPort(apiAddr)
+	if err != nil {
+		return apiAddr
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 func saveJoined(dir, controlAddr, gossipAddr string, wgPort int, wgEndpoint string, keys *node.Keys, resp *cluster.JoinResponse) error {
 	var seeds []string
 	for _, p := range resp.Peers {
@@ -278,6 +363,7 @@ func saveJoined(dir, controlAddr, gossipAddr string, wgPort int, wgEndpoint stri
 		NodeID:     resp.NodeID,
 		Cluster:    resp.Cluster,
 		Control:    controlAddr,
+		Controls:   resp.ControlAddrs,
 		Tier:       resp.Tier,
 		Roles:      resp.Roles,
 		MeshIP:     resp.MeshIP,
@@ -300,7 +386,7 @@ func adminClient(dir string) (*control.Client, error) {
 		return nil, fmt.Errorf("admin credentials (run token on the PC that ran init): %w", err)
 	}
 	cert.Certificate = append(cert.Certificate, n.CA.Raw)
-	return control.NewClient(n.Config.Control, cert, n.CA), nil
+	return control.NewClient(n.Config.ControlAddrs(), cert, n.CA), nil
 }
 
 // advertisable turns a listen address like ":7946" into one other PCs can

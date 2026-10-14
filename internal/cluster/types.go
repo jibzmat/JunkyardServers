@@ -164,6 +164,9 @@ type JoinResponse struct {
 	MeshCIDR  string   `json:"mesh_cidr"`
 	GossipKey []byte   `json:"gossip_key"` // AES-256 key for encrypted gossip
 	Peers     []Member `json:"peers"`
+	// ControlAddrs lists every control node's API address, so the node can
+	// reach the control plane when any one of them is down.
+	ControlAddrs []string `json:"control_addrs"`
 }
 
 // TokenRequest asks the control plane for a new join token (admin only).
@@ -176,4 +179,22 @@ type TokenRequest struct {
 // TokenResponse carries the encoded token.
 type TokenResponse struct {
 	Token string `json:"token"`
+}
+
+// ControlEnrollRequest asks to turn an owner-trusted node into a control node.
+type ControlEnrollRequest struct {
+	PublicKey []byte `json:"public_key"` // Ed25519 key for the control certificate
+	APIAddr   string `json:"api_addr"`
+	RaftAddr  string `json:"raft_addr"`
+}
+
+// ControlEnrollResponse hands over the control certificate and the CA key.
+type ControlEnrollResponse struct {
+	ID       string   `json:"id"`
+	CertPEM  []byte   `json:"cert_pem"`
+	CAPEM    []byte   `json:"ca_pem"`
+	CAKeyDER []byte   `json:"ca_key_der"`
+	APIAddr  string   `json:"api_addr"`
+	RaftAddr string   `json:"raft_addr"`
+	Peers    []string `json:"peers"`
 }
