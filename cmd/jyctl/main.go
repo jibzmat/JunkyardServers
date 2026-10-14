@@ -36,6 +36,7 @@ Commands:
   members   list the cluster's nodes
   control   add or remove control nodes (control add | control list | control remove <id>)
   wg-config print this node's WireGuard config in wg-quick format
+  tenant    create an S3 tenant and its access key (tenant create <name>)
 
 Run "jyctl <command> -h" for flags.
 `
@@ -59,6 +60,8 @@ func main() {
 		err = cmdControl(os.Args[2:])
 	case "wg-config":
 		err = cmdWGConfig(os.Args[2:])
+	case "tenant":
+		err = cmdTenant(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -88,6 +91,8 @@ func cmdInit(args []string) error {
 	wgPort := fs.Int("wg-port", 51820, "WireGuard listen port")
 	wgEndpoint := fs.String("wg-endpoint", "", "public WireGuard host:port, if this PC is reachable from outside")
 	roles := fs.String("roles", "control,gateway,compute,storage", "roles for this PC")
+	storagePort := fs.Int("storage-port", 7445, "shard server port (storage role)")
+	s3Listen := fs.String("s3", ":9000", "S3 API listen address (gateway role)")
 	fs.Parse(args)
 	if *addr == "" {
 		return errors.New("init: -control is required (for example 192.168.1.10:7443)")
@@ -116,17 +121,18 @@ func cmdInit(args []string) error {
 	}
 	gossipAddr := advertisable(*gossip, *addr)
 	resp, err := srv.EnrollLocal(cluster.JoinRequest{
-		SigningKey: keys.SigningPublic(),
-		WGPublic:   keys.WireGuard.PublicKey().String(),
-		WGEndpoint: *wgEndpoint,
-		GossipAddr: gossipAddr,
-		Roles:      rs,
-		Hardware:   hw.Detect(),
+		SigningKey:  keys.SigningPublic(),
+		WGPublic:    keys.WireGuard.PublicKey().String(),
+		WGEndpoint:  *wgEndpoint,
+		GossipAddr:  gossipAddr,
+		StoragePort: *storagePort,
+		Roles:       rs,
+		Hardware:    hw.Detect(),
 	})
 	if err != nil {
 		return err
 	}
-	if err := saveJoined(*dir, *addr, gossipAddr, *wgPort, *wgEndpoint, keys, resp); err != nil {
+	if err := saveJoined(*dir, *addr, gossipAddr, *wgPort, *wgEndpoint, *storagePort, *s3Listen, keys, resp); err != nil {
 		return err
 	}
 	fmt.Printf("Created cluster %q. This PC is %s at %s (%s).\n", *name, resp.NodeID, resp.MeshIP, resp.Tier)
@@ -165,6 +171,8 @@ func cmdJoin(args []string) error {
 	wgPort := fs.Int("wg-port", 51820, "WireGuard listen port")
 	wgEndpoint := fs.String("wg-endpoint", "", "public WireGuard host:port, if this PC is reachable from outside")
 	roles := fs.String("roles", "storage,compute", "roles to request; the control plane may grant fewer")
+	storagePort := fs.Int("storage-port", 7445, "shard server port (storage role)")
+	s3Listen := fs.String("s3", ":9000", "S3 API listen address (gateway role)")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		return errors.New("join: usage: jyctl join [flags] <token>")
@@ -197,17 +205,18 @@ func cmdJoin(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	resp, err := control.Join(ctx, tok, cluster.JoinRequest{
-		SigningKey: keys.SigningPublic(),
-		WGPublic:   keys.WireGuard.PublicKey().String(),
-		WGEndpoint: *wgEndpoint,
-		GossipAddr: gossipAddr,
-		Roles:      rs,
-		Hardware:   hw.Detect(),
+		SigningKey:  keys.SigningPublic(),
+		WGPublic:    keys.WireGuard.PublicKey().String(),
+		WGEndpoint:  *wgEndpoint,
+		GossipAddr:  gossipAddr,
+		StoragePort: *storagePort,
+		Roles:       rs,
+		Hardware:    hw.Detect(),
 	})
 	if err != nil {
 		return err
 	}
-	if err := saveJoined(*dir, tok.Control, gossipAddr, *wgPort, *wgEndpoint, keys, resp); err != nil {
+	if err := saveJoined(*dir, tok.Control, gossipAddr, *wgPort, *wgEndpoint, *storagePort, *s3Listen, keys, resp); err != nil {
 		return err
 	}
 	fmt.Printf("Joined cluster %q as %s at %s.\n", resp.Cluster, resp.NodeID, resp.MeshIP)
@@ -236,9 +245,13 @@ func cmdMembers(args []string) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tMESH IP\tTIER\tROLES\tCORES\tRAM\tSEV-SNP/TDX")
+	fmt.Fprintln(tw, "NODE\tMESH IP\tTIER\tROLES\tSHARD PORT\tCORES\tRAM\tSEV-SNP/TDX")
 	for _, m := range members {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%d\t%s\t%v\n", m.NodeID, m.MeshIP, m.Tier, m.Roles,
+		port := "-"
+		if m.StoragePort != 0 {
+			port = strconv.Itoa(m.StoragePort)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\t%d\t%s\t%v\n", m.NodeID, m.MeshIP, m.Tier, m.Roles, port,
 			m.Hardware.Cores, gib(m.Hardware.MemBytes), m.Hardware.Confidential())
 	}
 	return tw.Flush()
@@ -343,6 +356,33 @@ func cmdControl(args []string) error {
 	return fmt.Errorf("control: unknown subcommand %q", args[0])
 }
 
+func cmdTenant(args []string) error {
+	if len(args) < 1 || args[0] != "create" {
+		return errors.New("tenant: usage: jyctl tenant create [-dir DIR] <name>")
+	}
+	fs := flag.NewFlagSet("tenant create", flag.ExitOnError)
+	dir := fs.String("dir", defaultDir(), "state directory with admin.crt")
+	fs.Parse(args[1:])
+	if fs.NArg() != 1 {
+		return errors.New("tenant: usage: jyctl tenant create [-dir DIR] <name>")
+	}
+	c, err := adminClient(*dir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	t, err := c.CreateTenant(ctx, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Created tenant %q. Its S3 credentials (shown once):\n\n", t.Tenant)
+	fmt.Printf("  aws_access_key_id = %s\n  aws_secret_access_key = %s\n\n", t.AccessKeyID, t.SecretAccessKey)
+	fmt.Println("Use them with any S3 client pointed at a gateway, for example:")
+	fmt.Println("  aws --endpoint-url http://<gateway>:9000 s3 ls")
+	return nil
+}
+
 // raftAddrFor puts the Raft port on the API address's host.
 func raftAddrFor(apiAddr string, port int) string {
 	host, _, err := net.SplitHostPort(apiAddr)
@@ -352,7 +392,14 @@ func raftAddrFor(apiAddr string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
-func saveJoined(dir, controlAddr, gossipAddr string, wgPort int, wgEndpoint string, keys *node.Keys, resp *cluster.JoinResponse) error {
+func saveJoined(dir, controlAddr, gossipAddr string, wgPort int, wgEndpoint string, storagePort int, s3Listen string, keys *node.Keys, resp *cluster.JoinResponse) error {
+	granted := cluster.Member{Roles: resp.Roles}
+	if !granted.Has(cluster.RoleStorage) {
+		storagePort = 0
+	}
+	if !granted.Has(cluster.RoleGateway) {
+		s3Listen = ""
+	}
 	var seeds []string
 	for _, p := range resp.Peers {
 		if p.GossipAddr != "" {
@@ -373,6 +420,9 @@ func saveJoined(dir, controlAddr, gossipAddr string, wgPort int, wgEndpoint stri
 		WGPort:     wgPort,
 		WGEndpoint: wgEndpoint,
 		Seeds:      seeds,
+
+		StoragePort: storagePort,
+		S3Listen:    s3Listen,
 	}, keys, resp.CertPEM, resp.CAPEM)
 }
 

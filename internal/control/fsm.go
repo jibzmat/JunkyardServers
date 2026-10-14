@@ -1,10 +1,13 @@
 package control
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +39,7 @@ type state struct {
 	AccessKeys map[string]*s3meta.AccessKey         `json:"access_keys"`
 	Buckets    map[string]*s3meta.Bucket            `json:"buckets"`
 	Objects    map[string]map[string]*s3meta.Object `json:"objects"` // bucket -> key -> object
+	Uploads    map[string]*s3meta.Upload            `json:"uploads"` // multipart uploads by ID
 }
 
 func newState() *state {
@@ -67,6 +71,9 @@ func (st *state) fill() {
 	if st.Objects == nil {
 		st.Objects = map[string]map[string]*s3meta.Object{}
 	}
+	if st.Uploads == nil {
+		st.Uploads = map[string]*s3meta.Upload{}
+	}
 }
 
 // Command operations. Apply must be deterministic: anything time- or
@@ -84,6 +91,11 @@ const (
 	opDeleteBucket = "delete_bucket"
 	opPutObject    = "put_object"
 	opDeleteObject = "delete_object"
+
+	opCreateUpload   = "create_upload"
+	opPutPart        = "put_part"
+	opCompleteUpload = "complete_upload"
+	opAbortUpload    = "abort_upload"
 )
 
 type command struct {
@@ -103,6 +115,11 @@ type command struct {
 	Owner     string            `json:"owner,omitempty"` // tenant making the request
 	Name      string            `json:"name,omitempty"`  // bucket name
 	Key       string            `json:"key,omitempty"`   // object key
+
+	Upload   *s3meta.Upload         `json:"upload,omitempty"`
+	UploadID string                 `json:"upload_id,omitempty"`
+	Part     *s3meta.Part           `json:"part,omitempty"`
+	Parts    []s3meta.CompletedPart `json:"parts,omitempty"`
 }
 
 // Errors the state machine can return for a command.
@@ -134,15 +151,94 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var res any
+	var err error
 	switch c.Op {
 	case opPutObject, opDeleteObject:
-		old, err := f.applyObject(c)
-		if err != nil {
-			return err
-		}
-		return old
+		res, err = f.applyObject(c)
+	case opCreateUpload, opPutPart, opCompleteUpload, opAbortUpload:
+		res, err = f.applyUpload(c)
+	default:
+		return f.apply(c)
 	}
-	return f.apply(c)
+	if err != nil {
+		return err
+	}
+	return res
+}
+
+// applyUpload handles multipart uploads.
+func (f *fsm) applyUpload(c command) (any, error) {
+	st := f.st
+	if c.Op == opCreateUpload {
+		u := c.Upload
+		if b, ok := st.Buckets[u.Bucket]; !ok || b.Tenant != c.Owner {
+			return nil, s3meta.Errorf(s3meta.CodeNoSuchBucket, "bucket %q does not exist", u.Bucket)
+		}
+		u.Tenant = c.Owner
+		u.Parts = map[int]*s3meta.Part{}
+		st.Uploads[u.ID] = u
+		return nil, nil
+	}
+	u, ok := st.Uploads[c.UploadID]
+	if !ok || u.Tenant != c.Owner || u.Bucket != c.Name || u.Key != c.Key {
+		return nil, s3meta.Errorf(s3meta.CodeNoSuchUpload, "upload does not exist")
+	}
+	switch c.Op {
+	case opPutPart:
+		old := u.Parts[c.Part.Number]
+		u.Parts[c.Part.Number] = c.Part
+		return old, nil
+	case opAbortUpload:
+		delete(st.Uploads, u.ID)
+		return u, nil
+	}
+
+	// Complete: the listed parts must exist, match their ETags, ascend,
+	// and all but the last be at least MinPartSize.
+	if len(c.Parts) == 0 {
+		return nil, s3meta.Errorf(s3meta.CodeInvalidPart, "no parts listed")
+	}
+	obj := &s3meta.Object{Bucket: u.Bucket, Key: u.Key, ID: u.ID, ContentType: u.ContentType, Metadata: u.Metadata, Modified: c.Now}
+	md5s := md5.New()
+	used := map[int]bool{}
+	for i, cp := range c.Parts {
+		if i > 0 && cp.Number <= c.Parts[i-1].Number {
+			return nil, s3meta.Errorf(s3meta.CodeInvalidPartOrder, "parts must be listed in ascending order")
+		}
+		p, ok := u.Parts[cp.Number]
+		if !ok || strings.Trim(cp.ETag, `"`) != p.ETag {
+			return nil, s3meta.Errorf(s3meta.CodeInvalidPart, "part %d was not uploaded or its ETag differs", cp.Number)
+		}
+		if i < len(c.Parts)-1 && p.Size < s3meta.MinPartSize {
+			return nil, s3meta.Errorf(s3meta.CodeEntityTooSmall, "part %d is smaller than 5 MiB", cp.Number)
+		}
+		sum, _ := hex.DecodeString(p.ETag)
+		md5s.Write(sum)
+		obj.Parts = append(obj.Parts, p.Segment)
+		obj.Size += p.Size
+		used[cp.Number] = true
+	}
+	obj.ETag = fmt.Sprintf("%s-%d", hex.EncodeToString(md5s.Sum(nil)), len(c.Parts))
+	resp := &s3meta.CompleteUploadResponse{Object: obj}
+	for n, p := range u.Parts {
+		if !used[n] {
+			resp.Discard = append(resp.Discard, p.Segment)
+		}
+	}
+	b, ok := st.Buckets[u.Bucket]
+	if !ok || b.Tenant != c.Owner {
+		return nil, s3meta.Errorf(s3meta.CodeNoSuchBucket, "bucket %q does not exist", u.Bucket)
+	}
+	objs := st.Objects[u.Bucket]
+	if objs == nil {
+		objs = map[string]*s3meta.Object{}
+		st.Objects[u.Bucket] = objs
+	}
+	resp.Old = objs[u.Key]
+	objs[u.Key] = obj
+	delete(st.Uploads, u.ID)
+	return resp, nil
 }
 
 // applyObject handles object writes, returning the object replaced or
@@ -198,6 +294,11 @@ func (f *fsm) apply(c command) error {
 		}
 		if len(st.Objects[c.Name]) > 0 {
 			return s3meta.Errorf(s3meta.CodeBucketNotEmpty, "bucket %q is not empty", c.Name)
+		}
+		for _, u := range st.Uploads {
+			if u.Bucket == c.Name {
+				return s3meta.Errorf(s3meta.CodeBucketNotEmpty, "bucket %q has multipart uploads in progress", c.Name)
+			}
 		}
 		delete(st.Buckets, c.Name)
 		delete(st.Objects, c.Name)

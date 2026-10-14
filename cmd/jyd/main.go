@@ -1,6 +1,7 @@
 // Command jyd is the Junkyard node daemon. It runs on every PC, serves the
-// control plane API on PCs that are control nodes, gossips liveness, and
-// keeps the WireGuard mesh in sync.
+// control plane API on PCs that are control nodes, shards on storage nodes
+// and the S3 API on gateways, gossips liveness, and keeps the WireGuard mesh
+// in sync.
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/agent"
+	"github.com/jibzmat/JunkyardServers/internal/cluster"
 	"github.com/jibzmat/JunkyardServers/internal/control"
 	"github.com/jibzmat/JunkyardServers/internal/node"
 )
@@ -59,9 +61,28 @@ func main() {
 	}
 
 	a := agent.New(n, agent.Options{WireGuard: *wg, Interface: *iface, Logger: logger})
+	if hasRole(n.Config.Roles, cluster.RoleStorage) && n.Config.StoragePort != 0 {
+		srv, err := startStorage(*dir, n, a, logger)
+		if err != nil {
+			logger.Fatalf("storage: %v", err)
+		}
+		defer srv.Close()
+	}
+	if hasRole(n.Config.Roles, cluster.RoleGateway) && n.Config.S3Listen != "" {
+		srv, gw, err := startGateway(n, a, logger)
+		if err != nil {
+			logger.Fatalf("gateway: %v", err)
+		}
+		defer gw.Wait()
+		defer srv.Close()
+	}
 	if err := a.Run(ctx); err != nil {
 		logger.Fatal(err)
 	}
+}
+
+func hasRole(roles []cluster.Role, r cluster.Role) bool {
+	return cluster.Member{Roles: roles}.Has(r)
 }
 
 // activate asks the leader to add a freshly enrolled control node to the

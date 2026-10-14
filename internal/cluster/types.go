@@ -129,15 +129,28 @@ func (p Placement) Allows(host Tier, hostConfidential bool) bool {
 
 // Member is the control plane's record of a node.
 type Member struct {
-	NodeID     string  `json:"node_id"`
-	Roles      []Role  `json:"roles"`
-	Tier       Tier    `json:"tier"`
-	MeshIP     string  `json:"mesh_ip"`
-	WGPublic   string  `json:"wg_public"`             // base64 WireGuard public key
-	WGEndpoint string  `json:"wg_endpoint,omitempty"` // public host:port, if reachable
-	GossipAddr string  `json:"gossip_addr,omitempty"` // host:port for memberlist
-	Hardware   hw.Info `json:"hardware"`
-	JoinedAt   string  `json:"joined_at"`
+	NodeID     string `json:"node_id"`
+	Roles      []Role `json:"roles"`
+	Tier       Tier   `json:"tier"`
+	MeshIP     string `json:"mesh_ip"`
+	WGPublic   string `json:"wg_public"`             // base64 WireGuard public key
+	WGEndpoint string `json:"wg_endpoint,omitempty"` // public host:port, if reachable
+	GossipAddr string `json:"gossip_addr,omitempty"` // host:port for memberlist
+	// StoragePort is the shard server's port on storage nodes. It is
+	// reached on the mesh IP, or on the gossip host without a mesh.
+	StoragePort int     `json:"storage_port,omitempty"`
+	Hardware    hw.Info `json:"hardware"`
+	JoinedAt    string  `json:"joined_at"`
+}
+
+// Has reports whether the member holds a role.
+func (m Member) Has(r Role) bool {
+	for _, x := range m.Roles {
+		if x == r {
+			return true
+		}
+	}
+	return false
 }
 
 // JoinRequest is sent by a new node to the control plane.
@@ -148,6 +161,7 @@ type JoinRequest struct {
 	WGPublic    string  `json:"wg_public"`
 	WGEndpoint  string  `json:"wg_endpoint,omitempty"`
 	GossipAddr  string  `json:"gossip_addr,omitempty"`
+	StoragePort int     `json:"storage_port,omitempty"`
 	Roles       []Role  `json:"roles"`
 	Hardware    hw.Info `json:"hardware"`
 }

@@ -504,7 +504,13 @@ func (s *Server) admit(req cluster.JoinRequest, tokenID string, trusted bool) (*
 		WGEndpoint: req.WGEndpoint,
 		GossipAddr: req.GossipAddr,
 		Hardware:   req.Hardware,
-		JoinedAt:   s.now().UTC().Format(time.RFC3339),
+		StoragePort: func() int {
+			if hasRole(roles, cluster.RoleStorage) {
+				return req.StoragePort
+			}
+			return 0
+		}(),
+		JoinedAt: s.now().UTC().Format(time.RFC3339),
 	}
 	if err := s.apply(command{Op: opAdmit, TokenID: tokenID, Member: m}); err != nil {
 		if errors.Is(err, errTokenGone) {

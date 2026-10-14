@@ -9,12 +9,16 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // Node is a storage node shards can be placed on.
 type Node struct {
 	ID   string
 	Addr string // shard server host:port
+	// Name is what the node's certificate must name (its mesh IP). Empty
+	// means the host part of Addr.
+	Name string
 }
 
 // ShardRef says where one shard of a chunk lives.
@@ -55,6 +59,37 @@ type Store struct {
 	// Nodes returns the storage nodes currently usable for placement and
 	// the address of every known node (for reading shards placed earlier).
 	Nodes func() []Node
+
+	mu   sync.Mutex
+	down map[string]time.Time // nodes that recently failed a write
+}
+
+// DownFor is how long a node that failed a shard write is left out of
+// placement. Gossip notices dead nodes too, but only after tens of seconds.
+const DownFor = 30 * time.Second
+
+// writable returns the nodes not marked down.
+func (s *Store) writable() []Node {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	var out []Node
+	for _, n := range s.Nodes() {
+		if t, ok := s.down[n.ID]; ok && now.Before(t) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func (s *Store) markDown(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.down == nil {
+		s.down = map[string]time.Time{}
+	}
+	s.down[id] = time.Now().Add(DownFor)
 }
 
 // ErrNotEnoughNodes means fewer than k+1 storage nodes accepted a chunk.
@@ -66,7 +101,7 @@ var ErrNotEnoughNodes = errors.New("storage: not enough storage nodes reachable"
 // so one more node can fail before the chunk is at risk; repair restores the
 // rest later.
 func (s *Store) Put(ctx context.Context, objectID string, key ObjectKey, r io.Reader) (Layout, string, error) {
-	nodes := s.Nodes()
+	nodes := s.writable()
 	if len(nodes) == 0 {
 		return Layout{}, "", ErrNotEnoughNodes
 	}
@@ -80,6 +115,9 @@ func (s *Store) Put(ctx context.Context, objectID string, key ObjectKey, r io.Re
 			break
 		}
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			// The body failed (a dropped client, a bad signature or
+			// checksum): drop the chunks already stored.
+			s.cleanup(context.WithoutCancel(ctx), layout)
 			return Layout{}, "", err
 		}
 		plain := buf[:n]
@@ -122,6 +160,7 @@ func (s *Store) putChunk(ctx context.Context, objectID string, key ObjectKey, id
 	}
 	results := make([]result, len(shards))
 	var mu sync.Mutex
+	var lastErr error
 	used := map[string]bool{}
 	next := 0
 	claim := func() (Node, bool) {
@@ -148,10 +187,15 @@ func (s *Store) putChunk(ctx context.Context, objectID string, key ObjectKey, id
 				if !ok {
 					return
 				}
-				if err := s.Client.Put(ctx, node.Addr, hash, shard); err == nil {
+				err := s.Client.Put(ctx, node, hash, shard)
+				if err == nil {
 					results[i] = result{ShardRef{Index: i, Hash: hash, Node: node.ID}, true}
 					return
 				}
+				s.markDown(node.ID)
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
 			}
 		}(i, shard)
 	}
@@ -165,7 +209,7 @@ func (s *Store) putChunk(ctx context.Context, objectID string, key ObjectKey, id
 	}
 	if need := min(k+1, k+m); len(ref.Shards) < need {
 		s.cleanup(context.WithoutCancel(ctx), Layout{Chunks: []ChunkRef{ref}})
-		return ChunkRef{}, fmt.Errorf("%w: %d of %d shards stored", ErrNotEnoughNodes, len(ref.Shards), k+m)
+		return ChunkRef{}, fmt.Errorf("%w: %d of %d shards stored (%d nodes; last error: %v)", ErrNotEnoughNodes, len(ref.Shards), k+m, len(nodes), lastErr)
 	}
 	return ref, nil
 }
@@ -204,16 +248,16 @@ func (s *Store) Get(ctx context.Context, objectID string, key ObjectKey, layout 
 	return nil
 }
 
-func (s *Store) addrs() map[string]string {
-	out := map[string]string{}
+func (s *Store) addrs() map[string]Node {
+	out := map[string]Node{}
 	for _, n := range s.Nodes() {
-		out[n.ID] = n.Addr
+		out[n.ID] = n
 	}
 	return out
 }
 
 // getChunk fetches shards in parallel and decodes as soon as k have arrived.
-func (s *Store) getChunk(ctx context.Context, objectID string, key ObjectKey, layout Layout, idx uint64, c ChunkRef, addrs map[string]string) ([]byte, error) {
+func (s *Store) getChunk(ctx context.Context, objectID string, key ObjectKey, layout Layout, idx uint64, c ChunkRef, addrs map[string]Node) ([]byte, error) {
 	k, m := layout.DataShards, layout.ParityShards
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -224,12 +268,12 @@ func (s *Store) getChunk(ctx context.Context, objectID string, key ObjectKey, la
 	ch := make(chan got, len(c.Shards))
 	for _, sh := range c.Shards {
 		go func(sh ShardRef) {
-			addr, ok := addrs[sh.Node]
+			n, ok := addrs[sh.Node]
 			if !ok {
 				ch <- got{sh.Index, nil}
 				return
 			}
-			data, err := s.Client.Get(ctx, addr, sh.Hash)
+			data, err := s.Client.Get(ctx, n, sh.Hash)
 			if err != nil {
 				data = nil
 			}
@@ -269,15 +313,15 @@ func (s *Store) cleanup(ctx context.Context, layout Layout) {
 	var wg sync.WaitGroup
 	for _, c := range layout.Chunks {
 		for _, sh := range c.Shards {
-			addr, ok := addrs[sh.Node]
+			n, ok := addrs[sh.Node]
 			if !ok {
 				continue
 			}
 			wg.Add(1)
-			go func(addr, hash string) {
+			go func(n Node, hash string) {
 				defer wg.Done()
-				_ = s.Client.Delete(ctx, addr, hash)
-			}(addr, sh.Hash)
+				_ = s.Client.Delete(ctx, n, hash)
+			}(n, sh.Hash)
 		}
 	}
 	wg.Wait()

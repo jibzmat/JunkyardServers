@@ -263,7 +263,14 @@ func TestOnlyAllowedCallersDelete(t *testing.T) {
 	data := []byte("x")
 	h := ShardHash(data)
 	tc.stores[0].Put(h, data)
-	addr := tc.nodes[0].Addr
+	addr := tc.nodes[0]
+
+	// The server must hold the certificate for the expected name.
+	impostor := addr
+	impostor.Name = "100.64.0.9"
+	if _, err := tc.store.Client.Get(context.Background(), impostor, h); err == nil {
+		t.Fatal("accepted a server certificate for another name")
+	}
 
 	// A stranger's node certificate may read but not delete.
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)

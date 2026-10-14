@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/pki"
@@ -116,50 +117,73 @@ func (s *ShardServer) del(w http.ResponseWriter, r *http.Request) {
 
 // ShardClient talks to other nodes' shard servers.
 type ShardClient struct {
-	http *http.Client
+	tls *tls.Config
+
+	mu      sync.Mutex
+	clients map[string]*http.Client // by certificate name
 }
 
 // NewShardClient presents cert and trusts only the cluster CA.
 func NewShardClient(cert tls.Certificate, ca *x509.Certificate) *ShardClient {
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
+	return &ShardClient{
+		tls: &tls.Config{
 			MinVersion:   tls.VersionTLS13,
 			RootCAs:      pool,
 			Certificates: []tls.Certificate{cert},
 		},
-		ForceAttemptHTTP2:   true,
-		MaxIdleConnsPerHost: 8,
+		clients: map[string]*http.Client{},
 	}
-	return &ShardClient{http: &http.Client{Transport: tr, Timeout: 60 * time.Second}}
 }
 
-// Put uploads a shard to the node at addr.
-func (c *ShardClient) Put(ctx context.Context, addr, hash string, data []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "https://"+addr+"/v1/shards/"+hash, bytes.NewReader(data))
-	if err != nil {
-		return err
+// client returns an HTTP client that requires the server certificate to
+// name n (its mesh IP), whatever address it is dialed on.
+func (c *ShardClient) client(n Node) *http.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if hc, ok := c.clients[n.Name]; ok {
+		return hc
 	}
-	resp, err := c.http.Do(req)
+	cfg := c.tls.Clone()
+	cfg.ServerName = n.Name
+	hc := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: cfg, ForceAttemptHTTP2: true, MaxIdleConnsPerHost: 8},
+		Timeout:   60 * time.Second,
+	}
+	c.clients[n.Name] = hc
+	return hc
+}
+
+func (c *ShardClient) do(ctx context.Context, n Node, method, hash string, body []byte) (*http.Response, error) {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "https://"+n.Addr+"/v1/shards/"+hash, rd)
+	if err != nil {
+		return nil, err
+	}
+	return c.client(n).Do(req)
+}
+
+// Put uploads a shard to node n.
+func (c *ShardClient) Put(ctx context.Context, n Node, hash string, data []byte) error {
+	resp, err := c.do(ctx, n, http.MethodPut, hash, data)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("storage: put shard on %s: HTTP %d", addr, resp.StatusCode)
+		return fmt.Errorf("storage: put shard on %s: HTTP %d", n.ID, resp.StatusCode)
 	}
 	return nil
 }
 
 // Get downloads a shard and checks its hash.
-func (c *ShardClient) Get(ctx context.Context, addr, hash string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/v1/shards/"+hash, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.http.Do(req)
+func (c *ShardClient) Get(ctx context.Context, n Node, hash string) ([]byte, error) {
+	resp, err := c.do(ctx, n, http.MethodGet, hash, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +192,7 @@ func (c *ShardClient) Get(ctx context.Context, addr, hash string) ([]byte, error
 		return nil, ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("storage: get shard from %s: HTTP %d", addr, resp.StatusCode)
+		return nil, fmt.Errorf("storage: get shard from %s: HTTP %d", n.ID, resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxShardSize+1))
 	if err != nil {
@@ -180,20 +204,16 @@ func (c *ShardClient) Get(ctx context.Context, addr, hash string) ([]byte, error
 	return data, nil
 }
 
-// Delete removes a shard from the node at addr.
-func (c *ShardClient) Delete(ctx context.Context, addr, hash string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://"+addr+"/v1/shards/"+hash, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.http.Do(req)
+// Delete removes a shard from node n.
+func (c *ShardClient) Delete(ctx context.Context, n Node, hash string) error {
+	resp, err := c.do(ctx, n, http.MethodDelete, hash, nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("storage: delete shard on %s: HTTP %d", addr, resp.StatusCode)
+		return fmt.Errorf("storage: delete shard on %s: HTTP %d", n.ID, resp.StatusCode)
 	}
 	return nil
 }

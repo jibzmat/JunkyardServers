@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -94,7 +96,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	a.mu.Lock()
 	a.gossip = g
+	a.mu.Unlock()
 	defer g.Leave(5 * time.Second)
 
 	if n, err := g.Join(cfg.Seeds); err != nil && n == 0 {
@@ -125,6 +129,46 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
+// Registry returns the latest member list from the control plane.
+func (a *Agent) Registry() []cluster.Member {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]cluster.Member(nil), a.registry...)
+}
+
+// Alive returns the IDs of members gossip currently sees, or nil before
+// gossip has started.
+func (a *Agent) Alive() map[string]bool {
+	a.mu.Lock()
+	g := a.gossip
+	a.mu.Unlock()
+	if g == nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, m := range g.Alive() {
+		out[m.NodeID] = true
+	}
+	return out
+}
+
+// StorageAddr is where a member's shard server is reached: on its mesh IP
+// when the mesh is up, otherwise on the host it gossips from.
+func (a *Agent) StorageAddr(m cluster.Member) string {
+	if m.StoragePort == 0 {
+		return ""
+	}
+	host := m.MeshIP
+	if !a.opts.WireGuard {
+		h, _, err := net.SplitHostPort(m.GossipAddr)
+		if err != nil {
+			return ""
+		}
+		host = h
+	}
+	return net.JoinHostPort(host, strconv.Itoa(m.StoragePort))
+}
+
 func (a *Agent) trigger() {
 	select {
 	case a.kick <- struct{}{}:
@@ -146,9 +190,15 @@ func (a *Agent) refresh(ctx context.Context) {
 		a.client = control.NewClient(addrs, a.node.TLSCertificate(), a.node.CA)
 	}
 	members, err := a.client.Members(rctx)
-	if err != nil {
-		a.log.Printf("registry: %v", err)
-	} else {
+	if err != nil || !containsNode(members, a.node.Config.NodeID) {
+		// A control node that just restarted may still be replaying its
+		// log; retry soon rather than at the next refresh.
+		if err != nil {
+			a.log.Printf("registry: %v", err)
+		}
+		time.AfterFunc(2*time.Second, a.trigger)
+	}
+	if err == nil {
 		a.mu.Lock()
 		a.registry = members
 		a.mu.Unlock()
@@ -351,6 +401,15 @@ func ApplyRoutes(peers []mesh.Peer, routes []nat.Route) []mesh.Peer {
 		}
 	}
 	return out
+}
+
+func containsNode(members []cluster.Member, id string) bool {
+	for _, m := range members {
+		if m.NodeID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func publicEndpoint(ep string) bool {

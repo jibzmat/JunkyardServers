@@ -4,10 +4,19 @@ package s3meta
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/storage"
 )
+
+var bucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+
+// ValidBucketName applies S3's bucket naming rules.
+func ValidBucketName(name string) bool {
+	return bucketNameRE.MatchString(name) && !strings.Contains(name, "..")
+}
 
 // Tenant owns buckets. Its master key wraps every object's data key.
 type Tenant struct {
@@ -41,6 +50,105 @@ type Object struct {
 	Modified    time.Time      `json:"modified"`
 	WrappedKey  []byte         `json:"wrapped_key"` // data key sealed by the tenant master key
 	Layout      storage.Layout `json:"layout"`
+	// Metadata holds x-amz-meta-* headers (lower-case names, no prefix).
+	Metadata map[string]string `json:"meta,omitempty"`
+	// Parts is set for objects assembled by a multipart upload; each part
+	// has its own ID, data key and layout. ID, WrappedKey and Layout above
+	// are then unused.
+	Parts []Segment `json:"parts,omitempty"`
+}
+
+// Segment is one separately encrypted run of an object's bytes.
+type Segment struct {
+	ID         string         `json:"id"`
+	Size       int64          `json:"size"`
+	ETag       string         `json:"etag"` // hex MD5 of the plaintext
+	WrappedKey []byte         `json:"wrapped_key"`
+	Layout     storage.Layout `json:"layout"`
+}
+
+// Segments returns the object's byte runs in order.
+func (o *Object) Segments() []Segment {
+	if len(o.Parts) > 0 {
+		return o.Parts
+	}
+	return []Segment{{ID: o.ID, Size: o.Size, ETag: o.ETag, WrappedKey: o.WrappedKey, Layout: o.Layout}}
+}
+
+// Upload is a multipart upload in progress.
+type Upload struct {
+	ID          string            `json:"id"`
+	Tenant      string            `json:"tenant"`
+	Bucket      string            `json:"bucket"`
+	Key         string            `json:"key"`
+	ContentType string            `json:"content_type,omitempty"`
+	Metadata    map[string]string `json:"meta,omitempty"`
+	Created     time.Time         `json:"created"`
+	Parts       map[int]*Part     `json:"parts,omitempty"`
+}
+
+// Part is one uploaded part.
+type Part struct {
+	Number   int       `json:"number"`
+	Modified time.Time `json:"modified"`
+	Segment
+}
+
+// CompletedPart is a part named in CompleteMultipartUpload.
+type CompletedPart struct {
+	Number int    `json:"number"`
+	ETag   string `json:"etag"`
+}
+
+// Multipart limits, as in S3.
+const (
+	MinPartSize = 5 << 20
+	MaxPartSize = 5 << 30
+	MaxParts    = 10000
+)
+
+// UploadRequest names an upload. Bucket and key must match the upload's.
+type UploadRequest struct {
+	Tenant   string `json:"tenant"`
+	Bucket   string `json:"bucket"`
+	Key      string `json:"key"`
+	UploadID string `json:"upload_id"`
+}
+
+// CreateUploadRequest starts an upload.
+type CreateUploadRequest struct {
+	Tenant string `json:"tenant"`
+	Upload Upload `json:"upload"`
+}
+
+// PutPartRequest records an uploaded part.
+type PutPartRequest struct {
+	UploadRequest
+	Part Part `json:"part"`
+}
+
+// PartResponse returns the part a re-upload replaced, if any.
+type PartResponse struct {
+	Part *Part `json:"part,omitempty"`
+}
+
+// CompleteUploadRequest assembles the object.
+type CompleteUploadRequest struct {
+	UploadRequest
+	Parts []CompletedPart `json:"parts"`
+}
+
+// CompleteUploadResponse returns the new object, the one it replaced, and
+// uploaded parts left out of the object (their shards are to be deleted).
+type CompleteUploadResponse struct {
+	Object  *Object   `json:"object"`
+	Old     *Object   `json:"old,omitempty"`
+	Discard []Segment `json:"discard,omitempty"`
+}
+
+// UploadResponse returns an upload.
+type UploadResponse struct {
+	Upload *Upload `json:"upload,omitempty"`
 }
 
 // ListRequest is ListObjectsV2.
@@ -117,6 +225,10 @@ const (
 	CodeBucketNotEmpty   = "BucketNotEmpty"
 	CodeInvalidAccessKey = "InvalidAccessKeyId"
 	CodeTenantExists     = "TenantExists"
+	CodeNoSuchUpload     = "NoSuchUpload"
+	CodeInvalidPart      = "InvalidPart"
+	CodeInvalidPartOrder = "InvalidPartOrder"
+	CodeEntityTooSmall   = "EntityTooSmall"
 )
 
 // Error is a metadata error with an S3 error code.

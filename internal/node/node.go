@@ -42,6 +42,10 @@ type Config struct {
 	WGPort     int            `json:"wg_port"`
 	WGEndpoint string         `json:"wg_endpoint,omitempty"` // public host:port, if reachable
 	Seeds      []string       `json:"seeds"`                 // gossip addresses known at join
+	// StoragePort is where the shard server listens (storage role).
+	StoragePort int `json:"storage_port,omitempty"`
+	// S3Listen is where the S3 gateway listens (gateway role).
+	S3Listen string `json:"s3_listen,omitempty"`
 }
 
 // ControlAddrs returns the control plane addresses to try, in order.

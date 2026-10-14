@@ -41,6 +41,21 @@ func serve(t *testing.T, srv *Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	serveOn(t, srv, ln)
+}
+
+// listen reserves a port and keeps it, so parallel tests can't take it.
+func listen(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln
+}
+
+func serveOn(t *testing.T, srv *Server, ln net.Listener) {
+	t.Helper()
 	ts := httptest.NewUnstartedServer(srv.Handler())
 	ts.Listener.Close()
 	ts.Listener = ln
@@ -51,14 +66,16 @@ func serve(t *testing.T, srv *Server) {
 
 func newTestCluster(t *testing.T) *testCluster {
 	t.Helper()
-	addr := freeAddr(t)
+	ln := listen(t)
+	addr := ln.Addr().String()
 	dir := filepath.Join(t.TempDir(), "control")
 	srv, creds, err := Init(dir, "test", addr, freeAddr(t), nil)
 	if err != nil {
+		ln.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	serve(t, srv)
+	serveOn(t, srv, ln)
 	adminCert := pki.TLSCertificate(creds.CertDER, creds.Key, srv.CA())
 	return &testCluster{srv: srv, admin: NewClient([]string{addr}, adminCert, srv.CA()), addr: addr, creds: creds}
 }

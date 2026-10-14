@@ -30,7 +30,6 @@ const (
 )
 
 var (
-	bucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 	tenantNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 )
 
@@ -158,7 +157,7 @@ func (s *Server) Bucket(tenant, name string) (*s3meta.Bucket, error) {
 
 // CreateBucket creates a bucket. Names are global across tenants, as in S3.
 func (s *Server) CreateBucket(tenant, name string) error {
-	if !bucketNameRE.MatchString(name) || strings.Contains(name, "..") {
+	if !s3meta.ValidBucketName(name) {
 		return fmt.Errorf("invalid bucket name %q", name)
 	}
 	return s.apply(command{Op: opCreateBucket, Bucket: &s3meta.Bucket{Name: name, Tenant: tenant, Created: s.now().UTC()}})
@@ -275,7 +274,7 @@ func (s *Server) ListObjects(req s3meta.ListRequest) (*s3meta.ListResponse, erro
 			break
 		}
 		o := *objs[k]
-		o.WrappedKey, o.Layout = nil, storage.Layout{}
+		o.WrappedKey, o.Layout, o.Parts = nil, storage.Layout{}, nil
 		resp.Objects = append(resp.Objects, o)
 		last = k
 	}
@@ -283,6 +282,92 @@ func (s *Server) ListObjects(req s3meta.ListRequest) (*s3meta.ListResponse, erro
 		resp.Next = last
 	}
 	return resp, nil
+}
+
+// CreateUpload starts a multipart upload.
+func (s *Server) CreateUpload(tenant string, u s3meta.Upload) error {
+	if u.ID == "" || u.Key == "" || len(u.Key) > 1024 {
+		return errors.New("upload needs an ID and a 1-1024 byte key")
+	}
+	u.Created = s.now().UTC()
+	_, err := s.applyResult(command{Op: opCreateUpload, Owner: tenant, Upload: &u})
+	return err
+}
+
+// PutPart records a part and returns the one it replaced, if any.
+func (s *Server) PutPart(u s3meta.UploadRequest, p s3meta.Part) (*s3meta.Part, error) {
+	if p.Number < 1 || p.Number > s3meta.MaxParts {
+		return nil, fmt.Errorf("part number must be 1 to %d", s3meta.MaxParts)
+	}
+	p.Modified = s.now().UTC()
+	res, err := s.applyResult(command{Op: opPutPart, Owner: u.Tenant, Name: u.Bucket, Key: u.Key, UploadID: u.UploadID, Part: &p})
+	if err != nil {
+		return nil, err
+	}
+	old, _ := res.(*s3meta.Part)
+	return old, nil
+}
+
+// CompleteUpload assembles an object from uploaded parts.
+func (s *Server) CompleteUpload(u s3meta.UploadRequest, parts []s3meta.CompletedPart) (*s3meta.CompleteUploadResponse, error) {
+	res, err := s.applyResult(command{Op: opCompleteUpload, Owner: u.Tenant, Name: u.Bucket, Key: u.Key, UploadID: u.UploadID, Parts: parts, Now: s.now().UTC()})
+	if err != nil {
+		return nil, err
+	}
+	return res.(*s3meta.CompleteUploadResponse), nil
+}
+
+// AbortUpload drops an upload and returns it, so its parts can be deleted.
+func (s *Server) AbortUpload(u s3meta.UploadRequest) (*s3meta.Upload, error) {
+	res, err := s.applyResult(command{Op: opAbortUpload, Owner: u.Tenant, Name: u.Bucket, Key: u.Key, UploadID: u.UploadID})
+	if err != nil {
+		return nil, err
+	}
+	return res.(*s3meta.Upload), nil
+}
+
+// Upload returns an upload in progress.
+func (s *Server) Upload(req s3meta.UploadRequest) (*s3meta.Upload, error) {
+	var out *s3meta.Upload
+	s.fsm.view(func(st *state) {
+		if u, ok := st.Uploads[req.UploadID]; ok && u.Tenant == req.Tenant && u.Bucket == req.Bucket && u.Key == req.Key {
+			c := *u
+			c.Parts = map[int]*s3meta.Part{}
+			for n, p := range u.Parts {
+				c.Parts[n] = p
+			}
+			out = &c
+		}
+	})
+	if out == nil {
+		return nil, s3meta.Errorf(s3meta.CodeNoSuchUpload, "upload does not exist")
+	}
+	return out, nil
+}
+
+// ListUploads lists a bucket's uploads in progress, without their parts,
+// ordered by key then start time.
+func (s *Server) ListUploads(tenant, bucket string) ([]s3meta.Upload, error) {
+	if _, err := s.Bucket(tenant, bucket); err != nil {
+		return nil, err
+	}
+	out := []s3meta.Upload{}
+	s.fsm.view(func(st *state) {
+		for _, u := range st.Uploads {
+			if u.Tenant == tenant && u.Bucket == bucket {
+				c := *u
+				c.Parts = nil
+				out = append(out, c)
+			}
+		}
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].Created.Before(out[j].Created)
+	})
+	return out, nil
 }
 
 // --- HTTP ---
@@ -301,6 +386,89 @@ func (s *Server) s3Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/s3/objects/get", gw(s.handleObjectGet))
 	mux.HandleFunc("POST /v1/s3/objects/delete", gw(s.handleObjectDelete))
 	mux.HandleFunc("POST /v1/s3/objects/list", gw(s.handleObjectList))
+	mux.HandleFunc("POST /v1/s3/uploads/create", gw(s.handleUploadCreate))
+	mux.HandleFunc("POST /v1/s3/uploads/part", gw(s.handleUploadPart))
+	mux.HandleFunc("POST /v1/s3/uploads/complete", gw(s.handleUploadComplete))
+	mux.HandleFunc("POST /v1/s3/uploads/abort", gw(s.handleUploadAbort))
+	mux.HandleFunc("POST /v1/s3/uploads/get", gw(s.handleUploadGet))
+	mux.HandleFunc("POST /v1/s3/uploads/list", gw(s.handleUploadList))
+}
+
+func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
+	var req s3meta.CreateUploadRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.CreateUpload(req.Tenant, req.Upload); err != nil {
+		metaError(w, err)
+		return
+	}
+	writeJSON(w, struct{}{})
+}
+
+func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request) {
+	var req s3meta.PutPartRequest
+	if !decodeLimit(w, r, &req, maxMetaBodyBytes) {
+		return
+	}
+	old, err := s.PutPart(req.UploadRequest, req.Part)
+	if err != nil {
+		metaError(w, err)
+		return
+	}
+	writeJSON(w, s3meta.PartResponse{Part: old})
+}
+
+func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
+	var req s3meta.CompleteUploadRequest
+	if !decodeLimit(w, r, &req, maxMetaBodyBytes) {
+		return
+	}
+	resp, err := s.CompleteUpload(req.UploadRequest, req.Parts)
+	if err != nil {
+		metaError(w, err)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request) {
+	var req s3meta.UploadRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	u, err := s.AbortUpload(req)
+	if err != nil {
+		metaError(w, err)
+		return
+	}
+	writeJSON(w, s3meta.UploadResponse{Upload: u})
+}
+
+func (s *Server) handleUploadGet(w http.ResponseWriter, r *http.Request) {
+	var req s3meta.UploadRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	u, err := s.Upload(req)
+	if err != nil {
+		metaError(w, err)
+		return
+	}
+	writeJSON(w, s3meta.UploadResponse{Upload: u})
+}
+
+func (s *Server) handleUploadList(w http.ResponseWriter, r *http.Request) {
+	var req s3meta.BucketRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	out, err := s.ListUploads(req.Tenant, req.Bucket)
+	if err != nil {
+		metaError(w, err)
+		return
+	}
+	writeJSON(w, out)
 }
 
 // requireGateway admits control nodes and owner-trusted nodes holding the

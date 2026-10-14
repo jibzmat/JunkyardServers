@@ -226,6 +226,49 @@ func (c *Client) ListObjects(ctx context.Context, req s3meta.ListRequest) (*s3me
 	return &out, nil
 }
 
+// CreateUpload starts a multipart upload.
+func (c *Client) CreateUpload(ctx context.Context, tenant string, u s3meta.Upload) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/s3/uploads/create", s3meta.CreateUploadRequest{Tenant: tenant, Upload: u}, &out)
+}
+
+// PutPart records a part and returns the one it replaced, if any.
+func (c *Client) PutPart(ctx context.Context, u s3meta.UploadRequest, p s3meta.Part) (*s3meta.Part, error) {
+	var out s3meta.PartResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/uploads/part", s3meta.PutPartRequest{UploadRequest: u, Part: p}, &out)
+	return out.Part, err
+}
+
+// CompleteUpload assembles the object.
+func (c *Client) CompleteUpload(ctx context.Context, u s3meta.UploadRequest, parts []s3meta.CompletedPart) (*s3meta.CompleteUploadResponse, error) {
+	var out s3meta.CompleteUploadResponse
+	if err := c.call(ctx, http.MethodPost, "/v1/s3/uploads/complete", s3meta.CompleteUploadRequest{UploadRequest: u, Parts: parts}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AbortUpload drops an upload and returns it.
+func (c *Client) AbortUpload(ctx context.Context, u s3meta.UploadRequest) (*s3meta.Upload, error) {
+	var out s3meta.UploadResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/uploads/abort", u, &out)
+	return out.Upload, err
+}
+
+// Upload returns an upload in progress with its parts.
+func (c *Client) Upload(ctx context.Context, u s3meta.UploadRequest) (*s3meta.Upload, error) {
+	var out s3meta.UploadResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/uploads/get", u, &out)
+	return out.Upload, err
+}
+
+// ListUploads lists a bucket's uploads in progress.
+func (c *Client) ListUploads(ctx context.Context, tenant, bucket string) ([]s3meta.Upload, error) {
+	var out []s3meta.Upload
+	err := c.call(ctx, http.MethodPost, "/v1/s3/uploads/list", s3meta.BucketRequest{Tenant: tenant, Bucket: bucket}, &out)
+	return out, err
+}
+
 // call tries each address until one answers. A refusal from a reachable
 // control node (4xx) is returned at once; only transport failures and 503s
 // move on to the next address.
