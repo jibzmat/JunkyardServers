@@ -6,8 +6,10 @@ traffic and guest RAM are encrypted; PCs contributed by strangers only ever hold
 ciphertext. Strangers' PCs get the same storage and compute features as your
 own; the only difference is encrypted guest RAM, which needs SEV-SNP or TDX.
 
-This repository is at **milestone M0: mesh and cluster bootstrap**. See
-[docs/design.md](docs/design.md) for the architecture and roadmap.
+This repository has finished **M0 (mesh and cluster bootstrap)** and has the
+core of **M1 (encrypted S3 storage)**: the stock `aws s3` and `aws s3api`
+commands work against it. See [docs/design.md](docs/design.md) for the
+architecture and roadmap.
 
 ## What M0 does
 
@@ -37,6 +39,34 @@ This repository is at **milestone M0: mesh and cluster bootstrap**. See
   your trusted PCs: `jyctl control add` turns one into a control node. Any
   control node answers reads and redirects writes to the leader, and nodes
   fail over between control addresses on their own.
+
+## What M1 adds: S3
+
+- Storage nodes (any tier) run a shard server. Gateways (your trusted PCs)
+  serve the S3 API on port 9000.
+- Every object, and every part of a multipart upload, gets its own random
+  key. It is cut into 4 MiB chunks, each sealed with XChaCha20-Poly1305 and
+  Reed-Solomon coded (4 data + 2 parity with 6 or more storage nodes, fewer
+  on small clusters) onto different PCs. Storage nodes only see ciphertext
+  shards named by their SHA-256.
+- Object keys are wrapped by a per-tenant master key held by the control
+  plane, which also keeps buckets, objects and uploads in its Raft state.
+- The gateway checks SigV4 (headers, presigned URLs, signed and unsigned
+  streaming uploads, checksums, Content-MD5) and legacy SigV2.
+- Supported: list/create/delete/head bucket, get bucket location, put, get
+  (with ranges and conditional headers), head, delete, copy, multi-delete,
+  ListObjects v1 and v2, and multipart uploads including part copy. Anything
+  else (ACLs, policies, versioning, tagging) answers `NotImplemented`.
+- A chunk is written once k+1 of its shards are stored, so one more PC can
+  fail before it is at risk. Reads need any k shards. A PC that fails a write
+  is skipped for 30 seconds, so uploads keep working while gossip catches up.
+
+```sh
+sudo bin/jyctl tenant create alice      # prints an access key and secret
+export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://192.168.1.10:9000 s3 mb s3://photos
+aws --endpoint-url http://192.168.1.10:9000 s3 sync ~/Pictures s3://photos/
+```
 
 ## Try it
 
@@ -84,6 +114,9 @@ internal/node/        node identity and config on disk
 internal/membership/  encrypted gossip (liveness only)
 internal/mesh/        WireGuard mesh
 internal/agent/       jyd main loop
+internal/storage/     object encryption, erasure coding, placement, shard servers
+internal/s3meta/      S3 metadata types (tenants, buckets, objects, uploads)
+internal/s3gw/        S3 gateway: SigV4/SigV2, buckets, objects, multipart
 internal/cluster/     shared types: roles, trust tiers
 internal/hw/          hardware detection
 ```
@@ -94,7 +127,21 @@ internal/hw/          hardware detection
 go vet ./... && go test -race ./...
 ```
 
-## Not yet in M0
+## Not yet done
+
+M1:
+
+- Repair and scrubbing. Shards on a PC that is gone for good are not yet
+  rebuilt elsewhere, and objects written while PCs were down use the thinner
+  coding that fit the PCs left.
+- Tenant master keys are held whole by every control node; splitting them
+  with Shamir's scheme is next.
+- The gateway-side encrypted listing index for large buckets. Listing works
+  today from the control plane's state.
+- A gateway reads the control addresses it had at start; restart it after
+  adding or removing control nodes.
+
+From M0:
 
 - Control nodes are added by hand; automatic placement across healthy
   trusted PCs (the decentralized control plane) comes later.

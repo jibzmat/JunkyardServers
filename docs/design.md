@@ -37,6 +37,25 @@ Gossip is only trusted for liveness and current endpoints, because strangers
 hold the gossip key too. Tier, roles, keys and mesh addresses always come from
 the control plane registry.
 
+## Storage (M1)
+
+- Data path: client → gateway (SigV4) → per-object (or per-part) random
+  XChaCha20-Poly1305 key → 4 MiB chunks, each sealed with nonce = random
+  prefix || chunk index and additional data = object ID || chunk index →
+  Reed-Solomon k+m shards → rendezvous-hashed onto distinct storage nodes.
+- k+m is chosen from the number of live storage nodes: 4+2 with 6 or more,
+  down to 1+1 with two. A chunk counts as written with k+1 shards stored.
+- Key hierarchy: object keys are wrapped with AES-256-GCM by the tenant's
+  master key; master keys live in the control plane's Raft state and never
+  leave it. Gateways ask the control plane to wrap and unwrap.
+- Metadata (tenants, access keys, buckets, objects with shard layouts,
+  multipart uploads) lives in the Raft state machine. Overwrites and deletes
+  return the old record so the gateway deletes its shards.
+- Shard servers accept reads and writes from any cluster certificate (shards
+  are ciphertext named by hash) but deletes only from control nodes and
+  trusted gateways. Clients check the server certificate against the node's
+  mesh IP, which WireGuard binds to the node's key.
+
 ## Roadmap
 
 | Milestone | Scope | Exit test |
