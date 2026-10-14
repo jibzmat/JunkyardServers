@@ -70,6 +70,8 @@ architecture and roadmap.
 - Storage PCs re-read every shard daily and drop any that rotted; the next
   repair pass writes it back. Shards nothing refers to (a failed upload, a
   PC that returns after repair moved its shards) are deleted after 24 hours.
+- Objects written while few PCs were up (say 1+1 coding on two PCs) are
+  re-coded to the stronger coding once more PCs join, up to 1 GiB per pass.
 - A chunk is written once k+1 of its shards are stored, so one more PC can
   fail before it is at risk. Reads need any k shards. A PC that fails a write
   is skipped for 30 seconds, so uploads keep working while gossip catches up.
@@ -146,8 +148,6 @@ go vet ./... && go test -race ./...
 
 M1:
 
-- Objects written while PCs were down keep the thinner coding that fit the
-  PCs left; repair restores missing shards but doesn't upgrade the coding.
 - Object names are plaintext in the control plane's state, which only your
   trusted PCs hold. Encrypting them, with gateways building the listing
   index, waits until metadata moves to PCs that don't hold keys.

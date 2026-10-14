@@ -103,6 +103,7 @@ const (
 	opAbortUpload    = "abort_upload"
 
 	opMoveShards = "move_shards"
+	opRecode     = "recode_segment"
 
 	opPutKEK      = "put_kek"
 	opSetShareKey = "set_share_key"
@@ -137,6 +138,8 @@ type command struct {
 
 	SegmentID string             `json:"segment_id,omitempty"`
 	Moves     []s3meta.ShardMove `json:"moves,omitempty"`
+	Layout    *storage.Layout    `json:"layout,omitempty"`  // recode: the new layout
+	OldLayout string             `json:"old_sum,omitempty"` // recode: Sum of the layout replaced
 }
 
 // Errors the state machine can return for a command.
@@ -177,6 +180,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		res, err = f.applyUpload(c)
 	case opMoveShards:
 		err = f.applyMoves(c)
+	case opRecode:
+		err = f.applyRecode(c)
 	default:
 		return f.apply(c)
 	}
@@ -189,20 +194,20 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 // errStale means the object changed since repair read it.
 var errStale = errors.New("control: object changed during repair")
 
-// applyMoves records rebuilt shards. Stored objects are never modified in
-// place (readers hold shallow copies), so the object is copied first.
-func (f *fsm) applyMoves(c command) error {
+// copySegment returns a deep copy of the object named in c and a pointer
+// to the layout of segment c.SegmentID within it.
+func (f *fsm) copySegment(c command) (*s3meta.Object, *storage.Layout, error) {
 	old, ok := f.st.Objects[c.Name].get(c.Key)
 	if !ok {
-		return errStale
+		return nil, nil, errStale
 	}
 	b, err := json.Marshal(old)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	obj := &s3meta.Object{}
 	if err := json.Unmarshal(b, obj); err != nil {
-		return err
+		return nil, nil, err
 	}
 	var layout *storage.Layout
 	if len(obj.Parts) == 0 && obj.ID == c.SegmentID {
@@ -214,7 +219,32 @@ func (f *fsm) applyMoves(c command) error {
 		}
 	}
 	if layout == nil {
+		return nil, nil, errStale
+	}
+	return obj, layout, nil
+}
+
+// applyRecode replaces a segment's layout with one using a stronger
+// coding, if the layout is still the one the new one was made from.
+func (f *fsm) applyRecode(c command) error {
+	obj, layout, err := f.copySegment(c)
+	if err != nil {
+		return err
+	}
+	if c.Layout == nil || layout.Sum() != c.OldLayout || len(c.Layout.Chunks) != len(layout.Chunks) {
 		return errStale
+	}
+	*layout = *c.Layout
+	f.st.Objects[c.Name].set(c.Key, obj)
+	return nil
+}
+
+// applyMoves records rebuilt shards. Stored objects are never modified in
+// place (readers hold shallow copies), so the object is copied first.
+func (f *fsm) applyMoves(c command) error {
+	obj, layout, err := f.copySegment(c)
+	if err != nil {
+		return err
 	}
 	for _, mv := range c.Moves {
 		if mv.Chunk < 0 || mv.Chunk >= len(layout.Chunks) || mv.Index < 0 || mv.Index >= layout.DataShards+layout.ParityShards {

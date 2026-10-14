@@ -310,8 +310,14 @@ func TestUnreferencedShardsAreCollected(t *testing.T) {
 		t.Fatalf("collected young shards: %+v %v", st, err)
 	}
 
-	r = &Repairer{Meta: srv, Store: c.store, After: -1, Logger: quiet,
-		Now: func() time.Time { return time.Now().Add(2 * DefaultGCGrace) }}
+	// Old enough, but first seen unreferenced now: a download may still be
+	// reading them, so they are held a while longer.
+	at := time.Now().Add(2 * DefaultGCGrace)
+	r = &Repairer{Meta: srv, Store: c.store, After: -1, Logger: quiet, Now: func() time.Time { return at }}
+	if st, err := r.Pass(context.Background()); err != nil || st.Collected != 0 {
+		t.Fatalf("collected without the hold: %+v %v", st, err)
+	}
+	at = at.Add(GCHold + time.Second)
 	st, err := r.Pass(context.Background())
 	if err != nil || st.Collected != len(orphan.Chunks[0].Shards) || st.Rebuilt != 0 {
 		t.Fatalf("%+v %v (orphan has %d shards)", st, err, len(orphan.Chunks[0].Shards))
@@ -325,5 +331,39 @@ func TestUnreferencedShardsAreCollected(t *testing.T) {
 		if _, err := c.disks[sh.Node].Get(sh.Hash); err != nil {
 			t.Fatalf("referenced shard on %s deleted: %v", sh.Node, err)
 		}
+	}
+}
+
+func TestThinCodingIsUpgraded(t *testing.T) {
+	c := newCluster(t, 2) // 1+1 while only two PCs are up
+	srv := newControl(t)
+	data := make([]byte, 9<<20) // three chunks
+	rand.Read(data)
+	key, obj := put(t, c, srv, "k", data)
+	if obj.Layout.DataShards != 1 || obj.Layout.ParityShards != 1 {
+		t.Fatalf("coding %d+%d", obj.Layout.DataShards, obj.Layout.ParityShards)
+	}
+	for i := 0; i < 4; i++ {
+		c.add()
+	}
+	at := time.Now()
+	r := &Repairer{Meta: srv, Store: c.store, After: -1, Logger: log.New(io.Discard, "", 0), Now: func() time.Time { return at }}
+	st, err := r.Pass(context.Background())
+	if err != nil || st.Upgraded != 1 {
+		t.Fatalf("%+v %v", st, err)
+	}
+	got := current(t, srv, "k")
+	if got.Layout.DataShards != 4 || got.Layout.ParityShards != 2 || len(got.Layout.Chunks) != 3 {
+		t.Fatalf("layout %d+%d, %d chunks", got.Layout.DataShards, got.Layout.ParityShards, len(got.Layout.Chunks))
+	}
+	// Any two PCs can now go.
+	c.kill("n-0")
+	c.kill("n-1")
+	var out bytes.Buffer
+	if err := c.store.Get(context.Background(), got.ID, key, got.Layout, 0, -1, &out); err != nil || !bytes.Equal(out.Bytes(), data) {
+		t.Fatalf("read after upgrade: %v", err)
+	}
+	if st, _ := r.Pass(context.Background()); st.Upgraded != 0 {
+		t.Fatalf("upgraded twice: %+v", st)
 	}
 }

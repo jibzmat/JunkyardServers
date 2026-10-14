@@ -15,6 +15,7 @@ import (
 	"errors"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,11 +34,25 @@ const DefaultAfter = 15 * time.Minute
 // flight.
 const DefaultGCGrace = 24 * time.Hour
 
+// GCHold is how long a shard must stay unreferenced before it is deleted,
+// so a download that started before a re-code can
+// still finish reading the old shards.
+const GCHold = 15 * time.Minute
+
+// DefaultScanEvery is how often node inventories are listed for lost
+// shards and garbage. Listing walks every shard on every node, so it runs
+// far less often than the repair pass itself.
+const DefaultScanEvery = time.Hour
+
+// DefaultUpgradeBytes bounds how much data one pass re-codes.
+const DefaultUpgradeBytes = 1 << 30
+
 // Meta is what repair needs from the control plane.
 type Meta interface {
 	AllObjects() []s3meta.Object
 	AllUploads() []s3meta.Segment
 	MoveShards(bucket, key, segmentID string, moves []s3meta.ShardMove) error
+	Recode(bucket, key, segmentID, oldSum string, layout storage.Layout) error
 }
 
 // Repairer finds and rebuilds missing shards.
@@ -51,12 +66,20 @@ type Repairer struct {
 	// GCGrace is the minimum age of a shard garbage collection may delete;
 	// 0 means DefaultGCGrace.
 	GCGrace time.Duration
-	Logger  *log.Logger
-	Now     func() time.Time
+	// ScanEvery is how often Run lists node inventories; 0 means
+	// DefaultScanEvery. Pass always lists them.
+	ScanEvery time.Duration
+	// UpgradeBytes bounds the data re-coded per pass; 0 means
+	// DefaultUpgradeBytes, negative disables upgrades.
+	UpgradeBytes int64
+	Logger       *log.Logger
+	Now          func() time.Time
 
 	mu       sync.Mutex
 	started  time.Time
 	lastSeen map[string]time.Time
+	lastScan time.Time
+	unref    map[string]time.Time // "node/hash" -> first seen unreferenced
 }
 
 // Stats summarises a pass.
@@ -67,6 +90,7 @@ type Stats struct {
 	Failed  int // chunks that needed repair but could not get it
 
 	Collected int // unreferenced shards deleted
+	Upgraded  int // segments re-coded to the stronger coding more nodes allow
 }
 
 func (r *Repairer) now() time.Time {
@@ -88,6 +112,20 @@ func (r *Repairer) gcGrace() time.Duration {
 		return DefaultGCGrace
 	}
 	return r.GCGrace
+}
+
+func (r *Repairer) scanEvery() time.Duration {
+	if r.ScanEvery == 0 {
+		return DefaultScanEvery
+	}
+	return r.ScanEvery
+}
+
+func (r *Repairer) upgradeBytes() int64 {
+	if r.UpgradeBytes == 0 {
+		return DefaultUpgradeBytes
+	}
+	return r.UpgradeBytes
 }
 
 func (r *Repairer) logf(format string, args ...any) {
@@ -112,12 +150,19 @@ func (r *Repairer) Run(ctx context.Context, interval time.Duration, leader func(
 		if !leader() {
 			continue
 		}
-		st, err := r.pass(ctx, alive)
+		scan := r.now().Sub(r.lastScan) >= r.scanEvery()
+		if scan {
+			r.lastScan = r.now()
+		}
+		st, err := r.pass(ctx, alive, scan)
 		if err != nil {
 			r.logf("repair: %v", err)
 		}
 		if st.Rebuilt > 0 || st.Lost > 0 || st.Failed > 0 {
 			r.logf("repair: rebuilt %d shards; %d chunks still need repair, %d lost", st.Rebuilt, st.Failed, st.Lost)
+		}
+		if st.Upgraded > 0 {
+			r.logf("repair: re-coded %d segments written while nodes were down", st.Upgraded)
 		}
 		if st.Collected > 0 {
 			r.logf("repair: deleted %d unreferenced shards", st.Collected)
@@ -127,7 +172,7 @@ func (r *Repairer) Run(ctx context.Context, interval time.Duration, leader func(
 
 // Pass observes the live nodes and makes one repair pass.
 func (r *Repairer) Pass(ctx context.Context) (Stats, error) {
-	return r.pass(ctx, r.observe())
+	return r.pass(ctx, r.observe(), true)
 }
 
 // observe notes which storage nodes are alive now.
@@ -173,7 +218,7 @@ func (inv inventory) has(node, hash string) bool {
 	return ok
 }
 
-func (r *Repairer) pass(ctx context.Context, alive map[string]storage.Node) (Stats, error) {
+func (r *Repairer) pass(ctx context.Context, alive map[string]storage.Node, scan bool) (Stats, error) {
 	var st Stats
 	ids := make([]string, 0, len(alive))
 	for id := range alive {
@@ -183,9 +228,18 @@ func (r *Repairer) pass(ctx context.Context, alive map[string]storage.Node) (Sta
 	// written or refreshed after the listing, so it is never mistaken for
 	// old garbage.
 	listed := r.now()
-	inv := r.inventory(ctx, alive)
+	var inv inventory
+	if scan {
+		inv = r.inventory(ctx, alive)
+	}
 	objects := r.Meta.AllObjects()
 	uploads := r.Meta.AllUploads()
+	type candidate struct {
+		obj s3meta.Object
+		seg s3meta.Segment
+	}
+	var weak []candidate
+	_, wantM := storage.ChooseCoding(len(alive))
 	for _, obj := range objects {
 		// Shards of an object written while the nodes were being listed
 		// may be missing from the lists; don't treat them as lost.
@@ -197,10 +251,28 @@ func (r *Repairer) pass(ctx context.Context, alive map[string]storage.Node) (Sta
 			if err := ctx.Err(); err != nil {
 				return st, err
 			}
-			r.segment(ctx, obj, seg, alive, ids, check, &st)
+			if r.segment(ctx, obj, seg, alive, ids, check, &st) && seg.Layout.ParityShards < wantM {
+				weak = append(weak, candidate{obj, seg})
+			}
 		}
 	}
-	st.Collected = r.collect(ctx, alive, inv, objects, uploads)
+	budget := r.upgradeBytes()
+	nodes := make([]storage.Node, 0, len(alive))
+	for _, n := range alive {
+		nodes = append(nodes, n)
+	}
+	for _, c := range weak {
+		if ctx.Err() != nil || budget < c.seg.Layout.Size() {
+			break
+		}
+		budget -= c.seg.Layout.Size()
+		if r.upgrade(ctx, c.obj, c.seg, nodes) {
+			st.Upgraded++
+		}
+	}
+	if scan {
+		st.Collected = r.collect(ctx, alive, inv, objects, uploads)
+	}
 	return st, ctx.Err()
 }
 
@@ -228,6 +300,25 @@ func (r *Repairer) inventory(ctx context.Context, alive map[string]storage.Node)
 	return inv
 }
 
+// upgrade re-codes a segment written with fewer parity shards than the
+// cluster now allows. The old shards become garbage once the new layout is
+// recorded.
+func (r *Repairer) upgrade(ctx context.Context, obj s3meta.Object, seg s3meta.Segment, nodes []storage.Node) bool {
+	k, m := storage.ChooseCoding(len(nodes))
+	layout, err := r.Store.Recode(ctx, seg.ID, seg.Layout, k, m, nodes)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.logf("repair: re-coding %s/%s: %v", obj.Bucket, obj.Key, err)
+		}
+		return false
+	}
+	if err := r.Meta.Recode(obj.Bucket, obj.Key, seg.ID, seg.Layout.Sum(), layout); err != nil {
+		r.Store.Delete(context.WithoutCancel(ctx), layout)
+		return false
+	}
+	return true
+}
+
 // collect deletes shards that nothing refers to and that are older than
 // the grace period.
 func (r *Repairer) collect(ctx context.Context, alive map[string]storage.Node, inv inventory, objects []s3meta.Object, uploads []s3meta.Segment) int {
@@ -250,14 +341,38 @@ func (r *Repairer) collect(ctx context.Context, alive map[string]storage.Node, i
 	for _, seg := range uploads {
 		note(seg)
 	}
-	cutoff := r.now().Add(-r.gcGrace())
+	now := r.now()
+	cutoff := now.Add(-r.gcGrace())
+	r.mu.Lock()
+	unref := map[string]time.Time{}
+	for id, held := range inv {
+		for hash := range held {
+			if !used[id][hash] {
+				k := id + "/" + hash
+				since, ok := r.unref[k]
+				if !ok {
+					since = now
+				}
+				unref[k] = since
+			}
+		}
+	}
+	for k, since := range r.unref {
+		// Keep what was known about nodes not listed this time.
+		if node, _, _ := strings.Cut(k, "/"); inv[node] == nil {
+			unref[k] = since
+		}
+	}
+	r.unref = unref
+	r.mu.Unlock()
 	n := 0
 	for id, held := range inv {
 		for hash, mod := range held {
 			if ctx.Err() != nil {
 				return n
 			}
-			if used[id][hash] || mod.After(cutoff) {
+			since, ok := unref[id+"/"+hash]
+			if !ok || mod.After(cutoff) || now.Sub(since) < GCHold {
 				continue
 			}
 			if err := r.Store.Client.Delete(ctx, alive[id], hash); err == nil {
@@ -269,7 +384,9 @@ func (r *Repairer) collect(ctx context.Context, alive map[string]storage.Node, i
 }
 
 // segment repairs one segment's chunks and records the moves in one write.
-func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Segment, alive map[string]storage.Node, ids []string, inv inventory, st *Stats) {
+// It reports whether every shard of the segment was healthy.
+func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Segment, alive map[string]storage.Node, ids []string, inv inventory, st *Stats) bool {
+	complete := true
 	l := seg.Layout
 	total := l.DataShards + l.ParityShards
 	var moves []s3meta.ShardMove
@@ -291,6 +408,9 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 			case !r.gone(sh.Node):
 				waiting = true // down, but maybe only for a reboot
 			}
+		}
+		if len(healthy) != total {
+			complete = false
 		}
 		if len(healthy) == total || waiting {
 			continue // complete, or wait for the down node to return or be gone
@@ -345,7 +465,7 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 	}
 	st.Rebuilt += restoredAll
 	if len(moves) == 0 {
-		return
+		return complete
 	}
 	err := r.Meta.MoveShards(obj.Bucket, obj.Key, seg.ID, moves)
 	if err != nil {
@@ -354,9 +474,10 @@ func (r *Repairer) segment(ctx context.Context, obj s3meta.Object, seg s3meta.Se
 		if !errors.Is(err, context.Canceled) {
 			r.logf("repair: %s/%s: %v", obj.Bucket, obj.Key, err)
 		}
-		return
+		return false
 	}
 	st.Rebuilt += len(moves)
+	return false
 }
 
 func recorded(c storage.ChunkRef, idx int) string {

@@ -414,6 +414,12 @@ func (s *Server) MoveShards(bucket, key, segmentID string, moves []s3meta.ShardM
 	return s.apply(command{Op: opMoveShards, Name: bucket, Key: key, SegmentID: segmentID, Moves: moves})
 }
 
+// Recode records a segment rewritten with a stronger coding. It fails if
+// the segment's layout no longer has the sum oldSum.
+func (s *Server) Recode(bucket, key, segmentID, oldSum string, layout storage.Layout) error {
+	return s.apply(command{Op: opRecode, Name: bucket, Key: key, SegmentID: segmentID, OldLayout: oldSum, Layout: &layout})
+}
+
 // --- HTTP ---
 
 func (s *Server) s3Routes(mux *http.ServeMux) {

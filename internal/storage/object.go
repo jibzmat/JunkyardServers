@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -49,6 +51,13 @@ func (l Layout) Size() int64 {
 		n += int64(c.Size)
 	}
 	return n
+}
+
+// Sum identifies the layout's exact contents.
+func (l Layout) Sum() string {
+	b, _ := json.Marshal(l)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // Store reads and writes objects as shards on storage nodes. The coding for
@@ -140,6 +149,14 @@ func (s *Store) putChunk(ctx context.Context, objectID string, key ObjectKey, id
 	if err != nil {
 		return ChunkRef{}, err
 	}
+	ref, err := s.writeSealed(ctx, objectID, idx, sealed, k, m, nodes)
+	ref.Size = len(plain)
+	return ref, err
+}
+
+// writeSealed codes a sealed chunk and stores its shards on distinct nodes.
+// It succeeds once k+1 shards (all of them, if m is 0) are stored.
+func (s *Store) writeSealed(ctx context.Context, objectID string, idx uint64, sealed []byte, k, m int, nodes []Node) (ChunkRef, error) {
 	shards, err := Encode(sealed, k, m)
 	if err != nil {
 		return ChunkRef{}, err
@@ -201,7 +218,7 @@ func (s *Store) putChunk(ctx context.Context, objectID string, key ObjectKey, id
 	}
 	wg.Wait()
 
-	ref := ChunkRef{Size: len(plain), SealedSize: len(sealed)}
+	ref := ChunkRef{SealedSize: len(sealed)}
 	for _, r := range results {
 		if r.ok {
 			ref.Shards = append(ref.Shards, r.ref)
@@ -316,6 +333,28 @@ func (s *Store) getSealed(ctx context.Context, layout Layout, idx uint64, c Chun
 		return nil, fmt.Errorf("storage: chunk %d: only %d of %d needed shards reachable", idx, have, k)
 	}
 	return Decode(shards, k, m, c.SealedSize)
+}
+
+// Recode rewrites a segment's chunks with k+m coding on the given nodes,
+// returning the new layout. The chunks stay sealed throughout: no key is
+// needed. On failure the shards already written are deleted.
+func (s *Store) Recode(ctx context.Context, segmentID string, old Layout, k, m int, nodes []Node) (Layout, error) {
+	out := Layout{DataShards: k, ParityShards: m}
+	addrs := s.addrs()
+	for i, c := range old.Chunks {
+		sealed, err := s.getSealed(ctx, old, uint64(i), c, addrs)
+		if err == nil {
+			var ref ChunkRef
+			ref, err = s.writeSealed(ctx, segmentID, uint64(i), sealed, k, m, nodes)
+			ref.Size = c.Size
+			out.Chunks = append(out.Chunks, ref)
+		}
+		if err != nil {
+			s.cleanup(context.WithoutCancel(ctx), out)
+			return Layout{}, err
+		}
+	}
+	return out, nil
 }
 
 // Delete removes an object's shards. Unreachable nodes keep orphaned

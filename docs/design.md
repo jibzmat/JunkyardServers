@@ -73,8 +73,13 @@ the control plane registry.
   read) and deletes any whose hash no longer matches. The leader lists each
   live node's shards on every repair pass, so a shard a live node lost is
   rebuilt and written back to that node.
+- Upgrades: segments coded with fewer parity shards than the live node
+  count allows are re-coded (sealed chunks are re-coded without keys) and
+  swapped in with one Raft write that is refused if the layout changed.
 - Garbage collection: the same pass deletes shards no object or unfinished
-  upload refers to, once they are 24 hours old. Shards are written before
+  upload refers to, once they are 24 hours old and have been unreferenced
+  for 15 minutes (so downloads that started before a re-code finish).
+  Inventories are listed hourly, not on every pass. Shards are written before
   their object is recorded, so younger ones may belong to an upload in
   flight. Nodes are listed before metadata is read, so a shard recorded
   after the read is never older than the listing says.
