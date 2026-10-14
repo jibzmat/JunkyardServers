@@ -4,7 +4,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"net/netip"
 	"sort"
 	"sync"
 	"time"
@@ -13,11 +15,16 @@ import (
 	"github.com/jibzmat/JunkyardServers/internal/control"
 	"github.com/jibzmat/JunkyardServers/internal/membership"
 	"github.com/jibzmat/JunkyardServers/internal/mesh"
+	"github.com/jibzmat/JunkyardServers/internal/nat"
 	"github.com/jibzmat/JunkyardServers/internal/node"
 )
 
-// RefreshInterval is how often the registry is re-read from the control plane.
-const RefreshInterval = 30 * time.Second
+const (
+	// RefreshInterval is how often the registry is re-read from the control plane.
+	RefreshInterval = 30 * time.Second
+	// PathInterval is how often handshakes are checked and routes replanned.
+	PathInterval = 10 * time.Second
+)
 
 // Options configures an Agent.
 type Options struct {
@@ -41,6 +48,13 @@ type Agent struct {
 	mu       sync.Mutex
 	registry []cluster.Member
 	kick     chan struct{}
+
+	reflector  *nat.Reflector
+	planner    *nat.Planner
+	advertised string // the WireGuard endpoint currently in our gossip meta
+	forwarding bool
+
+	lastPeerCount int
 }
 
 // New prepares an agent for a joined node.
@@ -58,6 +72,11 @@ func New(n *node.Node, opts Options) *Agent {
 		opts:   opts,
 		log:    lg,
 		kick:   make(chan struct{}, 1),
+
+		reflector:     nat.NewReflector(),
+		planner:       nat.NewPlanner(),
+		advertised:    n.Config.WGEndpoint,
+		lastPeerCount: -1,
 	}
 }
 
@@ -70,6 +89,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		SecretKey: cfg.GossipKey,
 		Meta:      membership.Meta{NodeID: cfg.NodeID, WGEndpoint: cfg.WGEndpoint},
 		OnChange:  a.trigger,
+		OnMessage: a.onMessage,
 	})
 	if err != nil {
 		return err
@@ -83,6 +103,8 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	t := time.NewTicker(RefreshInterval)
 	defer t.Stop()
+	pt := time.NewTicker(PathInterval)
+	defer pt.Stop()
 	a.refresh(ctx)
 	for {
 		select {
@@ -93,6 +115,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case <-t.C:
 			a.refresh(ctx)
+		case <-pt.C:
+			a.sync()
 		case <-a.kick:
 			// A gossip change may be a node the registry copy doesn't
 			// know yet, so re-read it before resyncing.
@@ -145,10 +169,16 @@ func (a *Agent) sync() {
 	a.mu.Lock()
 	registry := append([]cluster.Member(nil), a.registry...)
 	a.mu.Unlock()
-	peers := Peers(registry, a.gossip.Alive(), a.node.Config.NodeID)
+	self := a.node.Config.NodeID
+	alive := a.gossip.Alive()
+	peers := Peers(registry, alive, self)
+	a.updateAdvertised(registry)
 
 	if !a.opts.WireGuard {
-		a.log.Printf("mesh: %d peers known (wireguard disabled)", len(peers))
+		if len(peers) != a.lastPeerCount {
+			a.lastPeerCount = len(peers)
+			a.log.Printf("mesh: %d peers known (wireguard disabled)", len(peers))
+		}
 		return
 	}
 	if a.dev == nil {
@@ -166,11 +196,166 @@ func (a *Agent) sync() {
 		}
 		a.dev = dev
 		a.log.Printf("mesh: %s up as %s with %d peers", a.opts.Interface, cfg.MeshIP, len(peers))
+	}
+
+	status, err := a.dev.Status()
+	if err != nil {
+		a.log.Printf("mesh: %v", err)
 		return
 	}
-	if err := a.dev.SetPeers(peers); err != nil {
+	now := time.Now()
+	handshakes := map[string]time.Time{}
+	for _, p := range peers {
+		st, ok := status[p.PublicKey]
+		if !ok {
+			continue
+		}
+		handshakes[p.NodeID] = st.LastHandshake
+		// Tell the peer where its packets come from (endpoint reflection).
+		if st.Endpoint != "" && now.Sub(st.LastHandshake) < nat.HandshakeFresh {
+			if b, err := json.Marshal(seenMsg{Seen: st.Endpoint}); err == nil {
+				_ = a.gossip.SendTo(p.NodeID, b)
+			}
+		}
+	}
+
+	relays := Relays(registry, alive, self)
+	if !a.forwarding && a.isRelay(registry) {
+		if err := mesh.EnableForwarding(a.opts.Interface); err != nil {
+			a.log.Printf("relay: %v", err)
+		} else {
+			a.forwarding = true
+			a.log.Printf("relay: forwarding enabled; this node relays for peers behind strict NATs")
+		}
+	}
+	ids := make([]string, len(peers))
+	for i, p := range peers {
+		ids[i] = p.NodeID
+	}
+	routes := a.planner.Plan(ids, relays, handshakes, now)
+	if err := a.dev.SetPeers(ApplyRoutes(peers, routes)); err != nil {
 		a.log.Printf("mesh: %v", err)
 	}
+}
+
+// seenMsg is the endpoint-reflection message: "your packets reach me from".
+type seenMsg struct {
+	Seen string `json:"seen"`
+}
+
+// onMessage handles direct gossip messages. Only registered nodes count.
+func (a *Agent) onMessage(from string, payload []byte) {
+	var m seenMsg
+	if json.Unmarshal(payload, &m) != nil || m.Seen == "" {
+		return
+	}
+	a.mu.Lock()
+	known := false
+	for _, mem := range a.registry {
+		if mem.NodeID == from {
+			known = true
+			break
+		}
+	}
+	a.mu.Unlock()
+	if known {
+		a.reflector.Observe(from, m.Seen, time.Now())
+	}
+}
+
+// updateAdvertised publishes our reflected public endpoint in gossip, unless
+// the operator set one explicitly with -wg-endpoint.
+func (a *Agent) updateAdvertised(registry []cluster.Member) {
+	if a.node.Config.WGEndpoint != "" {
+		return
+	}
+	trusted := map[string]bool{}
+	for _, m := range registry {
+		trusted[m.NodeID] = m.Tier == cluster.TierTrusted
+	}
+	ep, ok := a.reflector.Endpoint(time.Now(), func(id string) bool { return trusted[id] })
+	if !ok || ep == a.advertised {
+		return
+	}
+	if err := a.gossip.SetMeta(membership.Meta{NodeID: a.node.Config.NodeID, WGEndpoint: ep}); err != nil {
+		a.log.Printf("nat: advertise %s: %v", ep, err)
+		return
+	}
+	a.log.Printf("nat: peers see this node at %s; advertising it", ep)
+	a.advertised = ep
+}
+
+func (a *Agent) isRelay(registry []cluster.Member) bool {
+	for _, m := range registry {
+		if m.NodeID == a.node.Config.NodeID {
+			return m.Tier == cluster.TierTrusted && publicEndpoint(a.advertised)
+		}
+	}
+	return false
+}
+
+// Relays lists nodes that may relay for others: owner-trusted (relayed
+// mesh traffic passes through them), alive in gossip, and advertising a
+// public WireGuard endpoint. Sorted by node ID.
+func Relays(registry []cluster.Member, alive []membership.Meta, self string) []string {
+	live := map[string]string{}
+	for _, m := range alive {
+		live[m.NodeID] = m.WGEndpoint
+	}
+	var out []string
+	for _, m := range registry {
+		ep, ok := live[m.NodeID]
+		if !ok || m.NodeID == self || m.Tier != cluster.TierTrusted {
+			continue
+		}
+		if ep == "" {
+			ep = m.WGEndpoint
+		}
+		if publicEndpoint(ep) {
+			out = append(out, m.NodeID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ApplyRoutes turns routes into the WireGuard peer list: a relayed node gets
+// no peer entry of its own; its mesh address is routed through the relay.
+func ApplyRoutes(peers []mesh.Peer, routes []nat.Route) []mesh.Peer {
+	byID := map[string]int{}
+	out := make([]mesh.Peer, 0, len(peers))
+	relayed := map[string]bool{}
+	for _, r := range routes {
+		if r.Mode == nat.Relayed {
+			relayed[r.NodeID] = true
+		}
+	}
+	for _, p := range peers {
+		if relayed[p.NodeID] {
+			continue
+		}
+		p.Relayed = nil
+		byID[p.NodeID] = len(out)
+		out = append(out, p)
+	}
+	ips := map[string]string{}
+	for _, p := range peers {
+		ips[p.NodeID] = p.MeshIP
+	}
+	for _, r := range routes {
+		if r.Mode != nat.Relayed {
+			continue
+		}
+		if i, ok := byID[r.Via]; ok {
+			out[i].Relayed = append(out[i].Relayed, ips[r.NodeID])
+		}
+	}
+	return out
+}
+
+func publicEndpoint(ep string) bool {
+	ap, err := netip.ParseAddrPort(ep)
+	return err == nil && ap.Port() != 0 && nat.IsPublic(ap.Addr())
 }
 
 // Peers builds the WireGuard peer list: every registered node except self,

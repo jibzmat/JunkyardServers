@@ -65,3 +65,47 @@ func TestRejectsBadKey(t *testing.T) {
 		t.Fatal("short gossip key accepted")
 	}
 }
+
+func TestSendToAndSetMeta(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	got := make(chan string, 1)
+	a, err := Start(Config{
+		NodeID: "n-a", BindAddr: "127.0.0.1:0", SecretKey: key,
+		Meta:      Meta{NodeID: "n-a"},
+		OnMessage: func(from string, p []byte) { got <- from + ":" + string(p) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { a.Leave(time.Second) })
+	b := start(t, "n-b", key)
+	if _, err := b.Join([]string{a.Addr()}); err != nil {
+		t.Fatal(err)
+	}
+	waitAlive(t, b, 2)
+	if err := b.SendTo("n-a", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case m := <-got:
+		if m != "n-b:hello" {
+			t.Fatalf("got %q", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message not delivered")
+	}
+
+	if err := a.SetMeta(Meta{NodeID: "n-a", WGEndpoint: "198.51.100.1:51820"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range b.Alive() {
+			if m.NodeID == "n-a" && m.WGEndpoint == "198.51.100.1:51820" {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("updated meta did not reach b")
+}

@@ -26,6 +26,13 @@ This repository is at **milestone M0: mesh and cluster bootstrap**. See
   a WireGuard interface (`jy0`, `100.64.0.0/10`) in sync with every other node.
 - `jyctl members` and `jyctl wg-config` show the cluster and this node's mesh
   config.
+- PCs behind home routers find their public address from their peers
+  (endpoint reflection) and advertise it in gossip, so two PCs behind NAT can
+  punch through to each other. When a direct WireGuard handshake doesn't come
+  up within 45 seconds (strict NAT on both sides), traffic is routed through
+  one of your trusted PCs with a public address, and a direct path is retried
+  every 5 minutes. Relays are owner-trusted only, because relayed mesh packets
+  are decrypted and re-encrypted on the relay.
 - The control plane is replicated with Raft (over mutual TLS) across any of
   your trusted PCs: `jyctl control add` turns one into a control node. Any
   control node answers reads and redirects writes to the leader, and nodes
@@ -91,7 +98,9 @@ go vet ./... && go test -race ./...
 
 - Control nodes are added by hand; automatic placement across healthy
   trusted PCs (the decentralized control plane) comes later.
-- NAT traversal and relays for PCs that can't reach each other directly.
+- NAT traversal and relaying have unit tests but have not yet run on real
+  routers. At least one of your PCs needs a public address (or a forwarded
+  UDP port, passed as `-wg-endpoint`) to act as a relay.
 - Certificate rotation and revocation.
 
 ## License

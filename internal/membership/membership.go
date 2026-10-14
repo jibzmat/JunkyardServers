@@ -37,7 +37,11 @@ type Config struct {
 	// OnChange is called (from a gossip goroutine) when a node joins, leaves
 	// or updates. It must not block.
 	OnChange func()
-	Logger   *log.Logger
+	// OnMessage receives direct messages from other members. The sender ID
+	// is whatever the sender claimed, so treat the content as a hint. It
+	// must not block.
+	OnMessage func(from string, payload []byte)
+	Logger    *log.Logger
 }
 
 // Membership is a running gossip member.
@@ -89,7 +93,7 @@ func Start(cfg Config) (*Membership, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &delegate{meta: meta, onChange: cfg.OnChange}
+	d := &delegate{meta: meta, onChange: cfg.OnChange, onMessage: cfg.OnMessage}
 	mc.Delegate = d
 	mc.Events = d
 
@@ -129,6 +133,37 @@ func (m *Membership) Alive() []Meta {
 	return out
 }
 
+// SendTo sends a small direct message to one member.
+func (m *Membership) SendTo(nodeID string, payload []byte) error {
+	for _, n := range m.list.Members() {
+		if n.Name == nodeID {
+			b, err := json.Marshal(envelope{From: m.list.LocalNode().Name, Payload: payload})
+			if err != nil {
+				return err
+			}
+			return m.list.SendReliable(n, b)
+		}
+	}
+	return fmt.Errorf("membership: %s is not a live member", nodeID)
+}
+
+// SetMeta replaces this node's advertised metadata and spreads it.
+func (m *Membership) SetMeta(meta Meta) error {
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	m.del.mu.Lock()
+	m.del.meta = b
+	m.del.mu.Unlock()
+	return m.list.UpdateNode(5 * time.Second)
+}
+
+type envelope struct {
+	From    string `json:"f"`
+	Payload []byte `json:"p"`
+}
+
 // Leave announces departure and stops gossiping.
 func (m *Membership) Leave(timeout time.Duration) error {
 	err := m.list.Leave(timeout)
@@ -136,9 +171,10 @@ func (m *Membership) Leave(timeout time.Duration) error {
 }
 
 type delegate struct {
-	mu       sync.Mutex
-	meta     []byte
-	onChange func()
+	mu        sync.Mutex
+	meta      []byte
+	onChange  func()
+	onMessage func(from string, payload []byte)
 }
 
 func (d *delegate) NodeMeta(limit int) []byte {
@@ -150,7 +186,17 @@ func (d *delegate) NodeMeta(limit int) []byte {
 	return d.meta
 }
 
-func (d *delegate) NotifyMsg([]byte)                           {}
+func (d *delegate) NotifyMsg(b []byte) {
+	if d.onMessage == nil {
+		return
+	}
+	var e envelope
+	if json.Unmarshal(b, &e) != nil || e.From == "" {
+		return
+	}
+	d.onMessage(e.From, e.Payload)
+}
+
 func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte { return nil }
 func (d *delegate) LocalState(join bool) []byte                { return nil }
 func (d *delegate) MergeRemoteState(buf []byte, join bool)     {}

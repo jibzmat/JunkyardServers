@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -29,6 +30,9 @@ type Peer struct {
 	PublicKey string // base64 WireGuard public key
 	Endpoint  string // host:port, empty if the peer is not directly reachable
 	MeshIP    string
+	// Relayed lists other nodes' mesh IPs routed through this peer, when it
+	// acts as a relay for nodes we can't reach directly.
+	Relayed []string
 }
 
 // Config is the full mesh configuration for one node.
@@ -69,7 +73,11 @@ func (c Config) WGQuick() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Interface]\nPrivateKey = %s\nAddress = %s/%d\nListenPort = %d\n", c.PrivateKey, c.MeshIP, prefixBits, c.ListenPort)
 	for _, p := range sortedPeers(c.Peers) {
-		fmt.Fprintf(&b, "\n# %s\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n", p.NodeID, p.PublicKey, p.MeshIP)
+		allowed := p.MeshIP + "/32"
+		for _, r := range p.Relayed {
+			allowed += ", " + r + "/32"
+		}
+		fmt.Fprintf(&b, "\n# %s\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", p.NodeID, p.PublicKey, allowed)
 		if p.Endpoint != "" {
 			fmt.Fprintf(&b, "Endpoint = %s\n", p.Endpoint)
 		}
@@ -87,11 +95,19 @@ func (p Peer) peerConfig() (wgtypes.PeerConfig, error) {
 	if err != nil {
 		return wgtypes.PeerConfig{}, err
 	}
+	allowed := []net.IPNet{hostNet(ip)}
+	for _, r := range p.Relayed {
+		rip, err := netip.ParseAddr(r)
+		if err != nil {
+			return wgtypes.PeerConfig{}, fmt.Errorf("relayed ip: %w", err)
+		}
+		allowed = append(allowed, hostNet(rip))
+	}
 	ka := Keepalive
 	pc := wgtypes.PeerConfig{
 		PublicKey:                   key,
 		ReplaceAllowedIPs:           true,
-		AllowedIPs:                  []net.IPNet{{IP: ip.AsSlice(), Mask: net.CIDRMask(ip.BitLen(), ip.BitLen())}},
+		AllowedIPs:                  allowed,
 		PersistentKeepaliveInterval: &ka,
 	}
 	if p.Endpoint != "" {
@@ -102,6 +118,10 @@ func (p Peer) peerConfig() (wgtypes.PeerConfig, error) {
 		pc.Endpoint = ep
 	}
 	return pc, nil
+}
+
+func hostNet(ip netip.Addr) net.IPNet {
+	return net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(ip.BitLen(), ip.BitLen())}
 }
 
 func sortedPeers(peers []Peer) []Peer {
@@ -171,6 +191,44 @@ func (d *Device) SetPeers(peers []Peer) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// PeerStatus is what the kernel knows about one peer.
+type PeerStatus struct {
+	Endpoint      string    // where its packets currently come from
+	LastHandshake time.Time // zero if never
+}
+
+// Status returns the live state of every peer, keyed by public key.
+func (d *Device) Status() (map[string]PeerStatus, error) {
+	dev, err := d.wg.Device(d.Name)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]PeerStatus, len(dev.Peers))
+	for _, p := range dev.Peers {
+		ps := PeerStatus{LastHandshake: p.LastHandshakeTime}
+		if p.Endpoint != nil {
+			ps.Endpoint = p.Endpoint.String()
+		}
+		out[p.PublicKey.String()] = ps
+	}
+	return out, nil
+}
+
+// EnableForwarding lets this node relay packets between its WireGuard peers.
+// A host firewall that drops forwarded traffic (some Docker setups do) must
+// also allow forwarding from the mesh interface back to itself.
+func EnableForwarding(name string) error {
+	for _, path := range []string{
+		"/proc/sys/net/ipv4/ip_forward",
+		"/proc/sys/net/ipv4/conf/" + name + "/forwarding",
+	} {
+		if err := os.WriteFile(path, []byte("1\n"), 0o644); err != nil {
+			return fmt.Errorf("mesh: enable forwarding: %w", err)
+		}
+	}
+	return nil
 }
 
 // Close releases the control socket. The interface stays up so traffic is
