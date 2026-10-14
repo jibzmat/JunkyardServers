@@ -70,6 +70,9 @@ type ec2Command struct {
 	Object    *s3meta.Object         `json:"object,omitempty"`
 	Tags      *ec2meta.TagsRequest   `json:"tags,omitempty"`
 	Net       *vpcCommand            `json:"net,omitempty"`
+	// Target is the replica host for set_replica.
+	Target        string                 `json:"target,omitempty"`
+	ReplicaReport *ec2meta.ReplicaReport `json:"replica_report,omitempty"`
 }
 
 // ec2State is the EC2 part of the replicated state.
@@ -130,6 +133,9 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		return nil, errors.New("control: missing ec2 command")
 	}
 	if res, ok, err := f.applyVPC(c); ok {
+		return res, err
+	}
+	if res, ok, err := f.applyReplica(c); ok {
 		return res, err
 	}
 	switch c.Op {
@@ -894,7 +900,7 @@ func (s *Server) schedule() error {
 			switch {
 			case in.State == ec2meta.StateTerminated && now.Sub(in.Changed) > terminatedLinger:
 				purge = append(purge, in.ID)
-			case in.Host != "" && !isAlive(in.Host) && now.Sub(in.Changed) > hostLostAfter &&
+			case in.Host != "" && !isAlive(in.Host) && now.Sub(in.Changed) > hostLostAfter && !(in.Replica != "" && in.ReplicaSynced) &&
 				(in.State == ec2meta.StatePending || in.State == ec2meta.StateShuttingDown || in.State == ec2meta.StateStopping):
 				drops = append(drops, unassign{in.ID, in.Host, "Server.InternalError: host unreachable"})
 			case in.Host == "" && in.State == ec2meta.StatePending:
@@ -941,6 +947,9 @@ func (s *Server) schedule() error {
 		}
 		s.dropConsoles(purge)
 	}
+	if err := s.scheduleReplicas(alive, now); err != nil {
+		return err
+	}
 	return s.failLostTasks(isAlive)
 }
 
@@ -984,6 +993,7 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 				v.Tasks = append(v.Tasks, *t)
 			}
 		}
+		v.Replicas = replicaDisks(st, host)
 	})
 	sort.Slice(v.Networks, func(i, j int) bool { return v.Networks[i].VPC.ID < v.Networks[j].VPC.ID })
 	sort.Slice(v.Volumes, func(i, j int) bool { return v.Volumes[i].ID < v.Volumes[j].ID })
@@ -1061,6 +1071,7 @@ func (s *Server) ec2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/ec2/host", host(s.leaderOnly(s.handleHostView)))
 	mux.HandleFunc("POST /v1/ec2/host/console", host(s.leaderOnly(s.handleHostConsole)))
 	mux.HandleFunc("POST /v1/ec2/host/report", host(s.leaderOnly(s.handleHostReport)))
+	mux.HandleFunc("POST /v1/ec2/host/replica-report", host(s.leaderOnly(s.handleReplicaReport)))
 	mux.HandleFunc("GET /v1/ec2/host/images/{id}", host(s.handleHostImage))
 }
 

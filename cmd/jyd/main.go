@@ -30,6 +30,7 @@ func main() {
 	iface := flag.String("interface", "jy0", "mesh interface name")
 	verbose := flag.Bool("v", false, "log Raft internals")
 	emulate := flag.Bool("emulate", false, "run instances under QEMU's emulator on PCs without KVM (slow; for trying things out)")
+	replicaPort := flag.Int("replica-port", 7446, "port compute PCs exchange disk copies on (the same on every PC)")
 	repairAfter := flag.Duration("repair-after", repair.DefaultAfter, "rebuild a storage node's shards elsewhere after it has been unreachable this long")
 	flag.Parse()
 
@@ -96,7 +97,7 @@ func main() {
 		ctl.StartCompute(control.ComputeOptions{Alive: a.Alive, AllowEmulation: *emulate, Store: r.Store})
 	}
 	if hasRole(n.Config.Roles, cluster.RoleCompute) {
-		startCompute(ctx, *dir, a, *emulate, logger)
+		startCompute(ctx, *dir, n, a, *emulate, *replicaPort, logger)
 	}
 	if err := a.Run(ctx); err != nil {
 		logger.Fatal(err)

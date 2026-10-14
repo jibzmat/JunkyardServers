@@ -159,6 +159,12 @@ func (a *Agent) StorageAddr(m cluster.Member) string {
 	if m.StoragePort == 0 {
 		return ""
 	}
+	return a.PeerAddr(m, m.StoragePort)
+}
+
+// PeerAddr is where to reach port on a node: its mesh IP, or its gossip
+// host when there is no mesh.
+func (a *Agent) PeerAddr(m cluster.Member, port int) string {
 	host := m.MeshIP
 	if !a.opts.WireGuard {
 		h, _, err := net.SplitHostPort(m.GossipAddr)
@@ -167,7 +173,7 @@ func (a *Agent) StorageAddr(m cluster.Member) string {
 		}
 		host = h
 	}
-	return net.JoinHostPort(host, strconv.Itoa(m.StoragePort))
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func (a *Agent) trigger() {

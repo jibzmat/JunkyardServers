@@ -130,6 +130,16 @@ type Instance struct {
 	// Host is the PC running it, set by the scheduler.
 	Host string `json:"host,omitempty"` // node ID
 
+	// Replica is a second PC that keeps a live copy of the instance's root
+	// disk and attached volumes, and takes the instance over if Host is
+	// lost. ReplicaSynced is reported by Host: every disk's copy is
+	// complete and kept in step with each write.
+	Replica       string `json:"replica,omitempty"`
+	ReplicaSynced bool   `json:"replica_synced,omitempty"`
+	// Recovered is set once the instance has moved to its replica: its
+	// root disk must then come from there, never from the image again.
+	Recovered bool `json:"recovered,omitempty"`
+
 	// RebootSeq is bumped by RebootInstances; the host reboots the VM when
 	// it sees a value it hasn't acted on.
 	RebootSeq int `json:"reboot_seq,omitempty"`
@@ -206,6 +216,11 @@ type Volume struct {
 	// Ready is set once the host has created the data (blank, or restored
 	// from the snapshot).
 	Ready bool `json:"ready,omitempty"`
+	// Replica holds a copy while the volume is attached to an instance
+	// with a replica (the same PC); ReplicaSynced as for instances. A
+	// detached volume keeps the copy it had.
+	Replica       string `json:"replica,omitempty"`
+	ReplicaSynced bool   `json:"replica_synced,omitempty"`
 
 	Instance    string    `json:"instance,omitempty"`
 	Device      string    `json:"device,omitempty"`
@@ -307,6 +322,25 @@ type HostView struct {
 	Instances []Instance `json:"instances"`
 	Volumes   []Volume   `json:"volumes,omitempty"`
 	Tasks     []Task     `json:"tasks,omitempty"`
+	// Replicas are the disks this host keeps copies of for other hosts.
+	Replicas []ReplicaDisk `json:"replicas,omitempty"`
+}
+
+// ReplicaDisk is a disk (an instance's root disk, by instance ID, or a
+// volume) a host keeps a copy of, written only by its primary host.
+type ReplicaDisk struct {
+	ID      string `json:"id"`
+	Primary string `json:"primary"` // node ID
+}
+
+// ReplicaReport is a host reporting how far an instance's disk copies are.
+type ReplicaReport struct {
+	Instance string `json:"instance"`
+	Replica  string `json:"replica"`
+	// Synced: the root disk and every attached volume are in step.
+	Synced bool `json:"synced"`
+	// Volumes in step (a volume attached while running starts behind).
+	Volumes []string `json:"volumes,omitempty"`
 }
 
 // StatusReport is a host reporting an instance's actual state.

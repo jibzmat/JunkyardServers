@@ -242,6 +242,12 @@ func (c *Client) ReportVolume(ctx context.Context, r ec2meta.VolumeReport) error
 	return c.call(ctx, http.MethodPost, "/v1/ec2/host/volume-report", r, &out)
 }
 
+// ReportReplica tells the control plane how far an instance's disk copies are.
+func (c *Client) ReportReplica(ctx context.Context, r ec2meta.ReplicaReport) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/host/replica-report", r, &out)
+}
+
 // FailTask reports a task the host couldn't do.
 func (c *Client) FailTask(ctx context.Context, f ec2meta.TaskFailure) error {
 	var out struct{}

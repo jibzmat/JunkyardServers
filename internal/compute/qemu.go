@@ -42,7 +42,7 @@ func (q *QEMU) binary() string {
 // Check reports what's missing to run instances.
 func (q *QEMU) Check() error {
 	var missing []string
-	for _, b := range []string{q.binary(), "qemu-img", "ip"} {
+	for _, b := range []string{q.binary(), "qemu-img", "qemu-nbd", "ip"} {
 		if _, err := exec.LookPath(b); err != nil {
 			missing = append(missing, b)
 		}
@@ -169,7 +169,9 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 		"-name", in.ID, "-nodefaults", "-no-user-config",
 		"-machine", "q35", "-accel", accel, "-cpu", cpu,
 		"-smp", strconv.Itoa(in.VCPU), "-m", strconv.Itoa(in.MemMiB),
-		"-drive", "file=" + filepath.Join(vm.Dir, "disk.qcow2") + ",if=virtio,format=qcow2",
+		// The root disk is a named node so it can be mirrored.
+		"-blockdev", "driver=qcow2,node-name=" + rootNode + ",file.driver=file,file.filename=" + absPath(filepath.Join(vm.Dir, "disk.qcow2")),
+		"-device", "virtio-blk-pci,drive=" + rootNode + ",bootindex=0",
 		"-drive", "file=" + filepath.Join(vm.Dir, "seed.iso") + ",if=virtio,format=raw,readonly=on",
 		"-netdev", "tap,id=n0,ifname=" + t + ",script=no,downscript=no",
 		"-device", "virtio-net-pci,netdev=n0,mac=" + in.MAC,
@@ -202,6 +204,25 @@ const rootPorts = 8
 
 // nodeName and deviceID name a volume's block node and guest device.
 func nodeName(vol string) string { return "d-" + vol }
+
+// rootNode is the root disk's block node.
+const rootNode = "root"
+
+// diskNode is the block node of a VM's disk: the root disk (by instance
+// ID) or a volume.
+func diskNode(vm *VM, disk string) string {
+	if disk == vm.Instance.ID {
+		return rootNode
+	}
+	return nodeName(disk)
+}
+
+func absPath(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return p
+}
 func deviceID(vol string) string { return "v-" + vol }
 
 // volumeDevice is the virtio disk for a volume. Its serial is the volume
@@ -279,6 +300,9 @@ func (q *QEMU) Attach(ctx context.Context, vm *VM, d Disk) error {
 // The guest must cooperate (as on EC2, a volume in use may not detach
 // until it is unmounted); Detach fails until it does.
 func (q *QEMU) Detach(ctx context.Context, vm *VM, id string) error {
+	if err := q.StopMirror(ctx, vm, id); err != nil {
+		return err
+	}
 	if _, err := qmpRun(vm, qmpCmd{"device_del", map[string]any{"id": deviceID(id)}}); err != nil &&
 		!strings.Contains(err.Error(), "in the process of unplug") && !strings.Contains(err.Error(), "not found") {
 		return err
@@ -468,6 +492,169 @@ func qmpRun(vm *VM, cmds ...qmpCmd) ([]json.RawMessage, error) {
 		}
 	}
 	return out, nil
+}
+
+// Mirror jobs and target nodes are named after the disk.
+func mirrorJob(disk string) string  { return "m-" + disk }
+func mirrorNode(disk string) string { return "t-" + disk }
+
+// Mirrors reports the VM's mirror jobs.
+func (q *QEMU) Mirrors(vm *VM) (map[string]MirrorState, error) {
+	out, err := qmpRun(vm, qmpCmd{Execute: "query-block-jobs"})
+	if err != nil {
+		return nil, err
+	}
+	var jobs []struct {
+		Device         string `json:"device"`
+		Type           string `json:"type"`
+		Status         string `json:"status"`
+		Ready          bool   `json:"ready"`
+		ActivelySynced bool   `json:"actively-synced"`
+	}
+	if err := json.Unmarshal(out[0], &jobs); err != nil {
+		return nil, err
+	}
+	m := map[string]MirrorState{}
+	for _, j := range jobs {
+		disk, ok := strings.CutPrefix(j.Device, "m-")
+		if !ok || j.Type != "mirror" {
+			continue
+		}
+		switch j.Status {
+		case "concluded", "aborting", "null":
+			continue // failed; it is about to go
+		}
+		m[disk] = MirrorState{Ready: j.Ready, Synced: j.Ready && j.ActivelySynced}
+	}
+	return m, nil
+}
+
+// StartMirror copies a disk to the NBD server on socket and then mirrors
+// every write there before completing it to the guest.
+func (q *QEMU) StartMirror(ctx context.Context, vm *VM, disk, socket string) error {
+	_, _ = qmpRun(vm, qmpCmd{"blockdev-del", map[string]any{"node-name": mirrorNode(disk)}}) // left from a failed job
+	_, err := qmpRun(vm,
+		qmpCmd{"blockdev-add", map[string]any{
+			"driver": "nbd", "node-name": mirrorNode(disk), "export": "d",
+			"server": map[string]any{"type": "unix", "path": socket},
+			// A request waits this long for a lost connection to come
+			// back before failing (and the mirror with it).
+			"reconnect-delay": 5,
+		}},
+		qmpCmd{"blockdev-mirror", map[string]any{
+			"job-id": mirrorJob(disk), "device": diskNode(vm, disk), "target": mirrorNode(disk),
+			"sync": "full", "copy-mode": "write-blocking",
+		}})
+	return err
+}
+
+// StopMirror cancels a disk's mirror job and drops its target.
+func (q *QEMU) StopMirror(ctx context.Context, vm *VM, disk string) error {
+	if _, err := qmpRun(vm, qmpCmd{"block-job-cancel", map[string]any{"device": mirrorJob(disk), "force": true}}); err != nil &&
+		!strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "No active block job") {
+		return err
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		m, err := q.Mirrors(vm)
+		if err != nil {
+			return err
+		}
+		if _, ok := m[disk]; !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the mirror of %s did not stop", disk)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if _, err := qmpRun(vm, qmpCmd{"blockdev-del", map[string]any{"node-name": mirrorNode(disk)}}); err != nil &&
+		!strings.Contains(err.Error(), "not found") {
+		return err
+	}
+	return nil
+}
+
+// DiskSize reads a disk file's virtual size.
+func (q *QEMU) DiskSize(ctx context.Context, path string) (int64, error) {
+	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", path).Output()
+	if err != nil {
+		return 0, fmt.Errorf("qemu-img info %s: %v", path, err)
+	}
+	var info struct {
+		VirtualSize int64 `json:"virtual-size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return 0, err
+	}
+	return info.VirtualSize, nil
+}
+
+// Export serves a disk copy with qemu-nbd, a daemon that outlives jyd.
+func (q *QEMU) Export(ctx context.Context, path string, size int64, socket string) error {
+	if _, ok := nbdPID(socket); ok {
+		return nil
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		tmp := path + ".tmp"
+		if err := run(ctx, "qemu-img", "create", "-q", "-f", "qcow2", tmp, strconv.FormatInt(size, 10)); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return err
+		}
+	} else if cur, err := q.DiskSize(ctx, path); err != nil {
+		return err
+	} else if cur < size {
+		if err := run(ctx, "qemu-img", "resize", "-q", path, strconv.FormatInt(size, 10)); err != nil {
+			return err
+		}
+	}
+	os.Remove(socket)
+	if err := run(ctx, "qemu-nbd", "--fork", "--pid-file", socket+".pid", "--persistent",
+		"-f", "qcow2", "-x", "d", "-k", socket, path); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Unexport stops the qemu-nbd serving socket.
+func (q *QEMU) Unexport(socket string) {
+	if p, ok := nbdPID(socket); ok {
+		_ = syscall.Kill(p, syscall.SIGTERM) // it flushes the copy and exits
+		for i := 0; i < 50; i++ {
+			if _, ok := nbdPID(socket); !ok {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if _, ok := nbdPID(socket); ok {
+			_ = syscall.Kill(p, syscall.SIGKILL)
+		}
+	}
+	os.Remove(socket)
+	os.Remove(socket + ".pid")
+}
+
+// nbdPID returns the qemu-nbd serving socket, if it runs.
+func nbdPID(socket string) (int, bool) {
+	b, err := os.ReadFile(socket + ".pid")
+	if err != nil {
+		return 0, false
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || p <= 0 {
+		return 0, false
+	}
+	cmd, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", p))
+	if err != nil || !bytes.Contains(cmd, []byte(socket)) {
+		return 0, false
+	}
+	return p, true
 }
 
 var _ Driver = (*QEMU)(nil)

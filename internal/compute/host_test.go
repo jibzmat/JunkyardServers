@@ -3,13 +3,16 @@ package compute
 import (
 	"context"
 	"io"
+	"net"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/ec2meta"
 )
@@ -23,6 +26,19 @@ type fakeControl struct {
 	failed   []ec2meta.TaskFailure
 	uploads  map[string]string
 	consoles map[string]string
+	replicas []ec2meta.ReplicaReport
+}
+
+func (f *fakeControl) ReportReplica(_ context.Context, r ec2meta.ReplicaReport) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replicas = append(f.replicas, r)
+	for i := range f.view.Instances {
+		if in := &f.view.Instances[i]; in.ID == r.Instance {
+			in.ReplicaSynced = r.Synced
+		}
+	}
+	return nil
 }
 
 func (f *fakeControl) ReportVolume(_ context.Context, r ec2meta.VolumeReport) error {
@@ -164,6 +180,112 @@ type fakeDriver struct {
 	plugged map[string]map[string]bool // instance -> volumes
 	booted  map[string][]string        // instance -> volumes at last boot
 	stops   int
+	mirrors map[string]map[string]MirrorState // instance -> disk -> state
+	exports map[string]net.Listener           // socket -> fake NBD server
+}
+
+// The fake mirror sends the disk's bytes once to the socket; the fake NBD
+// server writes what it receives to the copy.
+func (d *fakeDriver) Mirrors(vm *VM) (map[string]MirrorState, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	m := map[string]MirrorState{}
+	for k, v := range d.mirrors[vm.Instance.ID] {
+		m[k] = v
+	}
+	return m, nil
+}
+
+func (d *fakeDriver) StartMirror(_ context.Context, vm *VM, disk, socket string) error {
+	src := filepath.Join(vm.Dir, "disk.qcow2")
+	if disk != vm.Instance.ID {
+		for _, x := range vm.Disks {
+			if x.ID == disk {
+				src = x.Path
+			}
+		}
+	}
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	c, err := net.Dial("unix", socket)
+	if err != nil {
+		return err
+	}
+	if _, err := c.Write(b); err != nil {
+		c.Close()
+		return err
+	}
+	c.Close()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.mirrors == nil {
+		d.mirrors = map[string]map[string]MirrorState{}
+	}
+	if d.mirrors[vm.Instance.ID] == nil {
+		d.mirrors[vm.Instance.ID] = map[string]MirrorState{}
+	}
+	d.mirrors[vm.Instance.ID][disk] = MirrorState{Ready: true, Synced: true}
+	return nil
+}
+
+func (d *fakeDriver) StopMirror(_ context.Context, vm *VM, disk string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.mirrors[vm.Instance.ID], disk)
+	return nil
+}
+
+func (d *fakeDriver) DiskSize(_ context.Context, path string) (int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+func (d *fakeDriver) Export(_ context.Context, path string, size int64, socket string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.exports[socket] != nil {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			return err
+		}
+	}
+	os.Remove(socket)
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		return err
+	}
+	if d.exports == nil {
+		d.exports = map[string]net.Listener{}
+	}
+	d.exports[socket] = ln
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			b, _ := io.ReadAll(c)
+			c.Close()
+			_ = os.WriteFile(path, b, 0o600)
+		}
+	}()
+	return nil
+}
+
+func (d *fakeDriver) Unexport(socket string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if ln := d.exports[socket]; ln != nil {
+		ln.Close()
+		delete(d.exports, socket)
+	}
 }
 
 func (d *fakeDriver) CreateDisk(_ context.Context, path string, sizeGiB int, from string) error {
@@ -232,7 +354,11 @@ func (d *fakeDriver) Prepare(_ context.Context, vm *VM, image string) error {
 	}
 	sub, _ := netip.ParsePrefix(vm.Subnet)
 	d.seeds[vm.Instance.ID] = metaData(vm.Instance) + userData(vm.Instance) + networkConfig(vm.Instance, sub.Addr().Next().String(), sub.Bits())
-	return os.WriteFile(filepath.Join(vm.Dir, "disk.qcow2"), []byte(image), 0o600)
+	disk := filepath.Join(vm.Dir, "disk.qcow2")
+	if _, err := os.Stat(disk); err == nil {
+		return nil // like QEMU's, never replaced
+	}
+	return os.WriteFile(disk, []byte(image), 0o600)
 }
 
 func (d *fakeDriver) Start(_ context.Context, vm *VM) error {
@@ -564,4 +690,117 @@ func TestMetadataService(t *testing.T) {
 	if code, _ := do("PUT", "/latest/api/token", me, map[string]string{tokenTTLHeader: "60", "X-Forwarded-For": "1.2.3.4"}); code != 403 {
 		t.Errorf("proxied token request got %d", code)
 	}
+}
+
+func TestReplicaAndFailover(t *testing.T) {
+	const id = "i-0123456789abcdef0"
+	inst := ec2meta.Instance{
+		ID: id, ImageID: "ami-1", State: ec2meta.StatePending, PrivateIP: "10.128.0.10", VpcID: "vpc-1", SubnetID: "subnet-1",
+		MAC: "02:00:00:00:00:01", VCPU: 1, MemMiB: 512, RootGiB: 8, Host: "node-a", Replica: "node-b",
+	}
+	ctlA := &fakeControl{view: ec2meta.HostView{Node: "node-a", Networks: testNets, Instances: []ec2meta.Instance{inst}}}
+	ctlB := &fakeControl{view: ec2meta.HostView{Node: "node-b", Networks: testNets,
+		Replicas: []ec2meta.ReplicaDisk{{ID: id, Primary: "node-a"}}}}
+	drvA, drvB := &fakeDriver{}, &fakeDriver{}
+	b := &Host{Control: ctlB, Driver: drvB, Dir: t.TempDir(), RunDir: t.TempDir()}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var peer atomic.Value
+	peer.Store("node-a")
+	go b.ServeReplicas(ln, func(net.Conn) (string, error) { return peer.Load().(string), nil })
+	a := &Host{Control: ctlA, Driver: drvA, Dir: t.TempDir(), RunDir: t.TempDir(),
+		DialReplica: func(ctx context.Context, node string) (net.Conn, error) {
+			if node != "node-b" {
+				t.Errorf("dialed %s", node)
+			}
+			return net.Dial("tcp", ln.Addr().String())
+		}}
+	ctx := context.Background()
+	step := func(h *Host) {
+		t.Helper()
+		if err := h.Step(ctx); err != nil {
+			t.Fatal(err)
+		}
+		h.Wait()
+	}
+	step(b) // learns which copies it keeps
+	step(a) // boots
+	ctlA.mu.Lock()
+	ctlA.view.Instances[0].State = ec2meta.StateRunning
+	ctlA.mu.Unlock()
+	step(a) // mirrors
+
+	want, err := os.ReadFile(filepath.Join(a.instanceDir(id), "disk.qcow2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyPath := b.replicaPath(id)
+	waitFor(t, func() bool {
+		got, _ := os.ReadFile(copyPath)
+		return string(got) == string(want)
+	})
+	step(a) // sees the copy in step and says so
+	ctlA.mu.Lock()
+	reps := append([]ec2meta.ReplicaReport(nil), ctlA.replicas...)
+	ctlA.mu.Unlock()
+	if len(reps) == 0 || !reps[len(reps)-1].Synced || reps[len(reps)-1].Replica != "node-b" {
+		t.Fatalf("replica reports %+v", reps)
+	}
+
+	// Another PC may not write the copy.
+	peer.Store("node-c")
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(c, `{"disk":"`+id+`","size":10}`+"\n")
+	line, _ := io.ReadAll(c)
+	c.Close()
+	if !strings.Contains(string(line), "no copy") {
+		t.Fatalf("a stranger was answered %q", line)
+	}
+
+	// node-a is lost: the instance moves to node-b and boots from the copy.
+	moved := inst
+	moved.Host, moved.Replica, moved.Recovered = "node-b", "", true
+	ctlB.mu.Lock()
+	ctlB.view.Replicas = nil
+	ctlB.view.Instances = []ec2meta.Instance{moved}
+	ctlB.mu.Unlock()
+	step(b)
+	got, err := os.ReadFile(filepath.Join(b.instanceDir(id), "disk.qcow2"))
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("booted from %q, %v; want the copy %q", got, err, want)
+	}
+	if _, err := os.Stat(copyPath); !os.IsNotExist(err) {
+		t.Fatalf("the copy is still kept as a replica: %v", err)
+	}
+	if !drvB.Running(&VM{Instance: moved}) {
+		t.Fatal("not running on node-b")
+	}
+
+	// A recovered instance whose copy is gone is not started from the image.
+	lost := moved
+	lost.ID = "i-0123456789abcdef1"
+	ctlB.mu.Lock()
+	ctlB.view.Instances = append(ctlB.view.Instances, lost)
+	ctlB.mu.Unlock()
+	step(b)
+	if drvB.Running(&VM{Instance: lost}) {
+		t.Fatal("started a recovered instance from its image")
+	}
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if ok() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out")
 }

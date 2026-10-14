@@ -190,7 +190,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		opPutKeyPair, opDeleteKeyPair, opPutImage, opDeleteImage, opTags,
 		opCreateVPC, opDeleteVPC, opCreateSubnet, opDeleteSubnet, opCreateGroup, opDeleteGroup, opGroupRules, opDefaultVPC,
 		opCreateVolume, opDeleteVolume, opAttachVolume, opDetachVolume, opVolumeReport,
-		opCreateSnapshot, opDeleteSnapshot, opCreateImage, opTaskDone, opTaskFailed:
+		opCreateSnapshot, opDeleteSnapshot, opCreateImage, opTaskDone, opTaskFailed,
+		opSetReplica, opReplicaReport, opFailover, opMoveVolume:
 		res, err = f.applyEC2(c)
 	default:
 		return f.apply(c)

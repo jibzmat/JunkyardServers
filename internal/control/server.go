@@ -94,6 +94,9 @@ type Server struct {
 	barrierTerm atomic.Uint64
 	compute     ComputeOptions
 	schedKick   chan struct{}
+	// lostSince is when this leader first saw each dead node (replica.go).
+	lostMu    sync.Mutex
+	lostSince map[string]time.Time
 
 	// Console output, in the leader's memory only (console.go).
 	consoleMu sync.Mutex

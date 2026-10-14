@@ -112,6 +112,9 @@ func (h *Host) volume(ctx context.Context, v ec2meta.Volume) (string, error) {
 	defer l.Unlock()
 
 	path := h.volumePath(v.ID)
+	if _, err := h.adopt(v.ID, path); err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(path); err == nil {
 		if !v.Ready {
 			h.reportVolume(ctx, ec2meta.VolumeReport{ID: v.ID, Ready: true})

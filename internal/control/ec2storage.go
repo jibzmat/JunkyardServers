@@ -142,6 +142,9 @@ func (f *fsm) applyEC2Storage(c command) (any, error) {
 			}
 		}
 		v.Host, v.Instance, v.Device = in.Host, in.ID, a.Device
+		if v.Replica != in.Replica {
+			v.Replica, v.ReplicaSynced = in.Replica, false
+		}
 		v.AttachState, v.AttachTime, v.State = ec2meta.AttachAttaching, c.Now, ec2meta.VolumeInUse
 		e.Volumes[v.ID] = v
 		return *v, nil

@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/agent"
@@ -19,6 +22,7 @@ import (
 	"github.com/jibzmat/JunkyardServers/internal/s3gw"
 	"github.com/jibzmat/JunkyardServers/internal/storage"
 	"github.com/jibzmat/JunkyardServers/internal/vnet"
+	"golang.org/x/sys/unix"
 )
 
 // mayDelete lets control nodes and owner-trusted gateways delete shards.
@@ -118,7 +122,7 @@ func storageNodes(a *agent.Agent) []storage.Node {
 }
 
 // startCompute runs this PC's instances, if it has what that takes.
-func startCompute(ctx context.Context, dir string, a *agent.Agent, emulate bool, logger *log.Logger) {
+func startCompute(ctx context.Context, dir string, n *node.Node, a *agent.Agent, emulate bool, replicaPort int, logger *log.Logger) {
 	q := &compute.QEMU{Emulate: emulate}
 	if err := q.Check(); err != nil {
 		logger.Printf("compute: not running instances: %v", err)
@@ -131,6 +135,68 @@ func startCompute(ctx context.Context, dir string, a *agent.Agent, emulate bool,
 	cdir := filepath.Join(dir, "compute")
 	h := &compute.Host{Control: a.Client(), Driver: q, Dir: cdir, Logger: logger, Metadata: true,
 		Net: &vnet.Manager{Dir: cdir, Logger: logger}}
+	pool := x509.NewCertPool()
+	pool.AddCert(n.CA)
+	cfg := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{n.TLSCertificate()},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		RootCAs:      pool,
+	}
+	lc := net.ListenConfig{Control: tuneReplicaConn, KeepAliveConfig: replicaKeepAlive}
+	if ln, err := lc.Listen(ctx, "tcp", ":"+strconv.Itoa(replicaPort)); err != nil {
+		logger.Printf("compute: not keeping disk copies: %v", err)
+	} else {
+		h.DialReplica = func(ctx context.Context, id string) (net.Conn, error) {
+			for _, m := range a.Registry() {
+				if m.NodeID == id {
+					c := cfg.Clone()
+					c.ServerName = m.MeshIP // certificates name the mesh IP
+					d := tls.Dialer{Config: c, NetDialer: &net.Dialer{Control: tuneReplicaConn, KeepAliveConfig: replicaKeepAlive}}
+					return d.DialContext(ctx, "tcp", a.PeerAddr(m, replicaPort))
+				}
+			}
+			return nil, fmt.Errorf("unknown node %s", id)
+		}
+		go func() {
+			err := h.ServeReplicas(tls.NewListener(ln, cfg), func(c net.Conn) (string, error) {
+				tc, ok := c.(*tls.Conn)
+				if !ok {
+					return "", errors.New("not TLS")
+				}
+				if err := tc.Handshake(); err != nil {
+					return "", err
+				}
+				st := tc.ConnectionState()
+				if len(st.VerifiedChains) == 0 || pki.KindOf(st.VerifiedChains[0][0]) != pki.KindNode {
+					return "", errors.New("not a node certificate")
+				}
+				return st.VerifiedChains[0][0].Subject.CommonName, nil
+			})
+			logger.Printf("compute: replica server: %v", err)
+		}()
+		logger.Printf("compute: keeping disk copies on %s", ln.Addr())
+	}
 	logger.Printf("compute: running instances (emulated: %v)", emulate)
 	go h.Run(ctx, 3*time.Second)
+}
+
+// A guest's writes wait for its disk copy, so a lost replica PC must be
+// noticed in seconds, not the minutes TCP would keep retrying: a write
+// unanswered this long drops the connection, and the mirror fails and is
+// started again once the control plane picks a new replica.
+const replicaConnTimeout = 10 * time.Second
+
+var replicaKeepAlive = net.KeepAliveConfig{Enable: true, Idle: 5 * time.Second, Interval: 2 * time.Second, Count: 3}
+
+func tuneReplicaConn(_, _ string, c syscall.RawConn) error {
+	var serr error
+	err := c.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, int(replicaConnTimeout/time.Millisecond))
+	})
+	if err != nil {
+		return err
+	}
+	return serr
 }

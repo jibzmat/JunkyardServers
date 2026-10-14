@@ -129,7 +129,7 @@ sudo ip netns exec jy-vpc-… ssh -i me.pem ubuntu@172.31.0.4
   are stored in the cluster, encrypted and erasure-coded like objects.
   Making one pauses the guest for the copy (create-image without
   `--no-reboot` shuts it down and restarts it, as EC2 does).
-- Compute PCs need `qemu-system-x86_64`, `qemu-img`, `genisoimage` (or
+- Compute PCs need `qemu-system-x86_64`, `qemu-img`, `qemu-nbd`, `genisoimage` (or
   `mkisofs`/`xorriso`), `iproute2` (with the `vxlan` kernel module) and
   `iptables`. `jyd -emulate` runs guests
   without KVM, very slowly, for trying things out.
@@ -167,6 +167,18 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   inside the VPC's namespace on the PC that runs the instance, as above
   (`sudo ip netns list` shows them). A tunnel through the gateway and
   public IPs come with M5.
+
+## What M4 adds so far: restart on host loss
+
+- Every instance's disks (root and attached volumes) are mirrored live to
+  a second compute PC its placement allows. A write finishes in the guest
+  only once both PCs have it.
+- If an instance's PC is gone for 2 minutes, the instance restarts on
+  that second PC from the copy, keeping its ID, address and data, and a
+  new second PC is picked. Volumes come along.
+- Compute PCs exchange disk copies on TCP port 7446 (`jyd -replica-port`,
+  the same on every PC), over mutual TLS inside the mesh. They need
+  `qemu-nbd`.
 
 ## Try it
 
@@ -236,14 +248,18 @@ go vet ./... && go test -race ./...
 
 M2:
 
-- Volumes are a single copy on one PC; if that PC dies, the data since the
-  last snapshot is lost. Replicating them across PCs is M4 work. A volume
-  on a PC that never comes back can't be deleted yet.
+- A volume on a PC that never comes back, without a copy in step, can't
+  be deleted yet.
 - SEV-SNP/TDX attestation, so `confidential` placement has no hosts yet.
-- Instances on a PC that dies are not restarted elsewhere (M4).
 - Public IPs and a way in from outside the VPC (M5).
 - Spot, launch templates, IAM instance profiles (the metadata service has
   no credentials to hand out yet).
+
+M4:
+
+- Proof-of-storage audits and reputation and quotas for strangers' PCs.
+- After any interruption a mirror copies the whole disk again (no
+  incremental resync yet), and the copy is out of step meanwhile.
 
 M3:
 

@@ -60,6 +60,22 @@ type Driver interface {
 	// Capture copies a disk to a standalone qcow2. A running VM is paused
 	// for the copy, so the data is consistent as of one instant.
 	Capture(ctx context.Context, vm *VM, src, dst string) error
+
+	// Mirrors reports a running VM's disk mirrors, by disk (the instance
+	// ID for the root disk, else the volume ID).
+	Mirrors(vm *VM) (map[string]MirrorState, error)
+	// StartMirror starts copying a disk, and then every write to it, to
+	// the NBD server on socket.
+	StartMirror(ctx context.Context, vm *VM, disk, socket string) error
+	// StopMirror stops a disk's mirror.
+	StopMirror(ctx context.Context, vm *VM, disk string) error
+	// DiskSize is a disk file's virtual size in bytes.
+	DiskSize(ctx context.Context, path string) (int64, error)
+	// Export serves a disk copy (made blank at size if missing) over NBD
+	// on socket, unless it already is.
+	Export(ctx context.Context, path string, size int64, socket string) error
+	// Unexport stops serving the copy on socket.
+	Unexport(socket string)
 }
 
 // Control is what the host needs from the control plane; *control.Client
@@ -73,6 +89,7 @@ type Control interface {
 	UploadTask(ctx context.Context, id string, open func() (io.ReadCloser, int64, error)) error
 	FetchSnapshot(ctx context.Context, id string, w io.Writer) error
 	SendConsole(ctx context.Context, c ec2meta.ConsoleOutput) error
+	ReportReplica(ctx context.Context, r ec2meta.ReplicaReport) error
 }
 
 // Network is the PC's VPC networking; *vnet.Manager implements it.
@@ -95,6 +112,11 @@ type Host struct {
 	Region string
 	// Net runs VPC networking; nil runs instances without (tests).
 	Net Network
+	// DialReplica connects to another compute PC's replica server
+	// (ServeReplicas); nil keeps no disk copies.
+	DialReplica func(ctx context.Context, node string) (net.Conn, error)
+	// RunDir holds unix sockets; default /run/junkyard.
+	RunDir string
 
 	mu       sync.Mutex
 	busy     map[string]bool
@@ -107,6 +129,15 @@ type Host struct {
 	byIP     map[string]ec2meta.Instance // for the metadata service
 	meta     *metadataServer
 	inflight sync.WaitGroup
+
+	// Disk replicas (replica.go).
+	proxies       map[string]*mirrorProxy // disk -> this host's mirror proxy
+	mirrorTo      map[string]string       // instance -> replica its mirrors go to
+	behind        map[string]time.Time    // disk -> since when its mirror is out of step
+	replicaFor    map[string]string       // disk -> primary, for copies kept here
+	staleReplicas map[string]time.Time    // copies no longer wanted, since when
+	replicaConns  map[string]net.Conn     // disk -> its primary's connection
+	retries       map[string]*mirrorRetry // instance -> when to start its mirrors again
 }
 
 // retryAfter is how long a failed start waits before the next try.
@@ -186,6 +217,17 @@ func (h *Host) Step(ctx context.Context) error {
 		}
 	}
 	tasks := h.volumeWork(ctx, v)
+	h.syncReplicas(ctx, v)
+	mirrored := map[string]bool{}
+	for _, in := range v.Instances {
+		if in.Replica != "" && (in.State == ec2meta.StateRunning || in.State == ec2meta.StatePending) {
+			mirrored[in.ID] = true
+			for _, vol := range attached[in.ID] {
+				mirrored[vol.ID] = true
+			}
+		}
+	}
+	h.closeProxies(mirrored)
 	assigned := map[string]bool{}
 	for _, in := range v.Instances {
 		assigned[in.ID] = true
@@ -311,6 +353,7 @@ func (h *Host) reconcile(ctx context.Context, vm *VM) {
 			writeSeq(vm, in.RebootSeq)
 		}
 		h.syncVolumes(ctx, vm, true)
+		h.syncMirrors(ctx, vm)
 
 	case ec2meta.StateStopping:
 		if err := h.Driver.Stop(ctx, vm, true); err != nil {
@@ -349,6 +392,15 @@ func (h *Host) start(ctx context.Context, vm *VM) error {
 	}
 	if err := os.MkdirAll(vm.Dir, 0o700); err != nil {
 		return err
+	}
+	// After a failover the root disk is this PC's copy, never a new one.
+	disk := filepath.Join(vm.Dir, "disk.qcow2")
+	adopted, err := h.adopt(vm.Instance.ID, disk)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(disk); err != nil && !adopted && vm.Instance.Recovered {
+		return errors.New("the copy of the root disk is missing from this PC")
 	}
 	if err := h.Driver.Prepare(ctx, vm, img); err != nil {
 		return err

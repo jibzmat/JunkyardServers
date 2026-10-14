@@ -173,6 +173,36 @@ instances reach the internet through NAT.
   mesh; reaching them from outside the VPC (an Instance Connect Endpoint
   style tunnel, public IPs) comes with M5.
 
+## Peer hardening (M4)
+
+- Disk replicas: the scheduler gives every placed instance a replica, a
+  second compute PC its placement allows with room to run it. The host
+  mirrors the root disk and attached volumes there with QEMU's mirror job
+  in write-blocking mode: after a first full copy, a guest write completes
+  only once the copy has it too. The copy is a qcow2 on the replica served
+  by qemu-nbd on a local socket; the two jyds carry the NBD stream over
+  mutual TLS (port 7446, the replica accepts only the instance's current
+  host). The host reports when every copy is in step.
+- Failover: when a host has been gone for 2 minutes (as this leader sees
+  it), each of its instances whose copies are in step moves to its
+  replica, which boots it from the copy (running instances restart;
+  stopped ones stay stopped), and a new replica is picked. Volumes whose
+  copy wasn't in step stay on the lost PC, detached; detached volumes with
+  a copy in step move too. An instance without a copy in step waits for
+  its PC.
+- A replica that dies stalls guest writes for at most about 15 seconds
+  (a TCP user timeout of 10 s on the connection, then QEMU's 5 s NBD
+  reconnect delay); the mirror then stops and the host retries with
+  backoff, checking the replica answers first. A mirror restarted from
+  scratch marks the copy out of step before it starts overwriting it.
+- Fencing: once the instance has moved, the old replica refuses its old
+  host's mirror connections, and the old host destroys the VM a minute
+  after it rejoins and sees the instance gone. If the old host was only
+  cut off, both copies ran for a while; that is the cost of not waiting
+  longer.
+- Not yet: incremental resync (a restart copies the whole disk again),
+  choosing a new replica for a detached volume, and a copy on a third PC.
+
 ## Roadmap
 
 | Milestone | Scope | Exit test |
