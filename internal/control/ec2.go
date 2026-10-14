@@ -913,6 +913,7 @@ func (s *Server) schedule() error {
 		if _, err := s.ec2Apply(opPurgeInstances, "", ec2Command{IDs: purge}); err != nil {
 			return err
 		}
+		s.dropConsoles(purge)
 	}
 	return s.failLostTasks(isAlive)
 }
@@ -1017,9 +1018,11 @@ func (s *Server) ec2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/ec2/images/delete", gw(s.handleDeleteImage))
 	mux.HandleFunc("POST /v1/ec2/images/list", gw(s.handleImages))
 	mux.HandleFunc("POST /v1/ec2/tags", gw(s.handleTags))
+	mux.HandleFunc("POST /v1/ec2/console", gw(s.handleConsole))
 
 	host := func(h http.HandlerFunc) http.HandlerFunc { return s.requireKind(h, pki.KindNode) }
 	mux.HandleFunc("GET /v1/ec2/host", host(s.leaderOnly(s.handleHostView)))
+	mux.HandleFunc("POST /v1/ec2/host/console", host(s.leaderOnly(s.handleHostConsole)))
 	mux.HandleFunc("POST /v1/ec2/host/report", host(s.leaderOnly(s.handleHostReport)))
 	mux.HandleFunc("GET /v1/ec2/host/images/{id}", host(s.handleHostImage))
 }

@@ -116,6 +116,13 @@ the control plane registry.
   disk to a standalone qcow2, resumes, and streams it to a control node,
   which stores it as an object in the hidden `_snapshots` or `_images`
   bucket and completes the task. Tasks on a host gone for 2 minutes fail.
+- Console output: hosts send the last 64 KiB of each VM's serial log when it
+  changes (and every 5 minutes); the leader keeps it in memory only.
+- Metadata service: each host answers 169.254.169.254 (DNATed to its bridge
+  address) from its own copy of its instances, identifying the caller by
+  source address. Per-tap ebtables rules drop frames whose MAC, ARP or
+  IPv4 source isn't the instance's, so the address can be trusted.
+  IMDSv2 tokens are HMACs bound to the instance and its address.
 - A host destroys VMs it no longer sees only after a minute, and the control
   plane serves host views only once a leader has applied the whole log, so
   a restart can't make a host wipe its VMs.

@@ -4,6 +4,9 @@
 package ec2meta
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -272,6 +275,23 @@ type TaskFailure struct {
 	ID     string `json:"id"`
 	Reason string `json:"reason"`
 }
+
+// AccountID is a stable 12-digit account number for a tenant, shown as
+// owner IDs and in instance identity documents.
+func AccountID(tenant string) string {
+	h := sha256.Sum256([]byte("jy-owner:" + tenant))
+	return fmt.Sprintf("%012d", binary.BigEndian.Uint64(h[:8])%1_000_000_000_000)
+}
+
+// ConsoleOutput is the tail of an instance's serial console.
+type ConsoleOutput struct {
+	InstanceID string    `json:"instance_id"`
+	Output     []byte    `json:"output"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// MaxConsole is how much console output is kept, as on EC2.
+const MaxConsole = 64 << 10
 
 // HostSubnetBits is the size of the subnet each compute host's instances
 // get addresses from.

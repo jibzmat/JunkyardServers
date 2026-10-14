@@ -52,7 +52,7 @@ func (q *QEMU) binary() string {
 // Check reports what's missing to run instances.
 func (q *QEMU) Check() error {
 	var missing []string
-	for _, b := range []string{q.binary(), "qemu-img", "ip", "iptables"} {
+	for _, b := range []string{q.binary(), "qemu-img", "ip", "iptables", "ebtables"} {
 		if _, err := exec.LookPath(b); err != nil {
 			missing = append(missing, b)
 		}
@@ -113,6 +113,14 @@ func (q *QEMU) Network(ctx context.Context, subnet netip.Prefix) error {
 		{"filter", "JY-FORWARD", "FORWARD", [][]string{
 			{"-i", br, "-j", "ACCEPT"},
 			{"-o", br, "-j", "ACCEPT"},
+		}},
+		// The metadata service, as guests address it.
+		{"nat", "JY-PRE", "PREROUTING", [][]string{
+			{"-i", br, "-d", MetadataIP + "/32", "-p", "tcp", "--dport", "80",
+				"-j", "DNAT", "--to-destination", net.JoinHostPort(gw.Addr().String(), strconv.Itoa(MetadataPort))},
+		}},
+		{"filter", "JY-INPUT", "INPUT", [][]string{
+			{"-i", br, "-p", "tcp", "--dport", strconv.Itoa(MetadataPort), "-j", "ACCEPT"},
 		}},
 	}
 	for _, r := range rules {
@@ -232,6 +240,9 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 		return err
 	}
 	in := vm.Instance
+	if err := antiSpoof(ctx, t, in.PrivateIP, in.MAC); err != nil {
+		return err
+	}
 	accel, cpu := "kvm", "host"
 	if q.Emulate {
 		accel, cpu = "tcg,thread=multi", "max"
@@ -469,10 +480,50 @@ func (q *QEMU) Destroy(ctx context.Context, vm *VM) error {
 	if err := q.Stop(ctx, vm, false); err != nil {
 		return err
 	}
+	removeAntiSpoof(ctx, tap(vm.Instance.ID))
 	if _, err := net.InterfaceByName(tap(vm.Instance.ID)); err == nil {
 		return run(ctx, "ip", "link", "del", tap(vm.Instance.ID))
 	}
 	return nil
+}
+
+// antiSpoof stops a VM sending frames with any address but its own, so it
+// can't pass itself off as another instance (the metadata service and
+// other instances trust source addresses). Each tap gets an ebtables
+// chain, rebuilt on every start.
+func antiSpoof(ctx context.Context, tap, ip, mac string) error {
+	chain := "JY-" + tap
+	_ = run(ctx, "ebtables", "-N", chain, "-P", "RETURN")
+	if err := run(ctx, "ebtables", "-F", chain); err != nil {
+		return err
+	}
+	for _, rule := range [][]string{
+		{"-s", "!", mac, "-j", "DROP"},
+		{"-p", "ARP", "--arp-mac-src", "!", mac, "-j", "DROP"},
+		{"-p", "ARP", "--arp-ip-src", "!", ip, "-j", "DROP"},
+		{"-p", "IPv4", "--ip-src", "!", ip, "-j", "DROP"},
+	} {
+		if err := run(ctx, "ebtables", append([]string{"-A", chain}, rule...)...); err != nil {
+			return err
+		}
+	}
+	for _, hook := range []string{"INPUT", "FORWARD"} {
+		for run(ctx, "ebtables", "-D", hook, "-i", tap, "-j", chain) == nil {
+		}
+		if err := run(ctx, "ebtables", "-A", hook, "-i", tap, "-j", chain); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeAntiSpoof(ctx context.Context, tap string) {
+	chain := "JY-" + tap
+	for _, hook := range []string{"INPUT", "FORWARD"} {
+		for run(ctx, "ebtables", "-D", hook, "-i", tap, "-j", chain) == nil {
+		}
+	}
+	_ = run(ctx, "ebtables", "-X", chain)
 }
 
 // qmp sends one command without arguments over the instance's QMP socket.

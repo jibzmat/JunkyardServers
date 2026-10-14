@@ -123,7 +123,7 @@ func startCompute(ctx context.Context, dir string, a *agent.Agent, emulate bool,
 		logger.Printf("compute: not running instances: %v", err)
 		return
 	}
-	h := &compute.Host{Control: a.Client(), Driver: q, Dir: filepath.Join(dir, "compute"), Logger: logger}
+	h := &compute.Host{Control: a.Client(), Driver: q, Dir: filepath.Join(dir, "compute"), Logger: logger, Metadata: true}
 	logger.Printf("compute: running instances (emulated: %v)", emulate)
 	go h.Run(ctx, 3*time.Second)
 }

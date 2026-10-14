@@ -71,6 +71,7 @@ type Control interface {
 	FailTask(ctx context.Context, f ec2meta.TaskFailure) error
 	UploadTask(ctx context.Context, id string, open func() (io.ReadCloser, int64, error)) error
 	FetchSnapshot(ctx context.Context, id string, w io.Writer) error
+	SendConsole(ctx context.Context, c ec2meta.ConsoleOutput) error
 }
 
 // Host reconciles this PC's VMs with the control plane.
@@ -79,6 +80,10 @@ type Host struct {
 	Driver  Driver
 	Dir     string
 	Logger  *log.Logger
+	// Metadata serves the instance metadata service (169.254.169.254).
+	Metadata bool
+	// Region is reported to instances; default us-east-1.
+	Region string
 
 	mu       sync.Mutex
 	busy     map[string]bool
@@ -87,6 +92,9 @@ type Host struct {
 	volumes  map[string]*sync.Mutex
 	done     map[string]time.Time // tasks finished here, until the view drops them
 	missing  map[string]time.Time // VM dirs not in the view, since when
+	consoles map[string]consoleSent
+	byIP     map[string]ec2meta.Instance // for the metadata service
+	meta     *metadataServer
 	subnet   string
 	inflight sync.WaitGroup
 }
@@ -142,10 +150,24 @@ func (h *Host) Step(ctx context.Context) error {
 		if err := h.Driver.Network(ctx, p); err != nil {
 			return err
 		}
+		if h.Metadata {
+			if err := h.startMetadata(ctx, p); err != nil {
+				return err
+			}
+		}
 		h.mu.Lock()
 		h.subnet = v.Subnet
 		h.mu.Unlock()
 	}
+	byIP := map[string]ec2meta.Instance{}
+	for _, in := range v.Instances {
+		if in.PrivateIP != "" && in.State != ec2meta.StateTerminated {
+			byIP[in.PrivateIP] = in
+		}
+	}
+	h.mu.Lock()
+	h.byIP = byIP
+	h.mu.Unlock()
 	attached := map[string][]ec2meta.Volume{}
 	for _, vol := range v.Volumes {
 		if vol.Instance != "" {
@@ -163,6 +185,7 @@ func (h *Host) Step(ctx context.Context) error {
 			for _, t := range todo {
 				h.runTask(ctx, t, vm)
 			}
+			h.sendConsole(ctx, vm)
 		})
 	}
 	// VMs no longer assigned here (purged, or moved off a host thought

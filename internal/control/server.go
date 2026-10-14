@@ -94,6 +94,10 @@ type Server struct {
 	barrierTerm atomic.Uint64
 	compute     ComputeOptions
 	schedKick   chan struct{}
+
+	// Console output, in the leader's memory only (console.go).
+	consoleMu sync.Mutex
+	consoles  map[string]consoleEntry
 }
 
 // AdminCredentials is the certificate an operator's jyctl uses.

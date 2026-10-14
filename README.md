@@ -105,7 +105,12 @@ ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
   register/describe/deregister images, create-image from an instance,
   volumes (create, attach, detach, delete, describe), snapshots (create,
   delete, describe, and volumes restored from them), tags, regions, zones
-  and instance types (t3, m5, c5, r5 sizes). `aws ec2 wait` works.
+  and instance types (t3, m5, c5, r5 sizes), get-console-output. `aws ec2
+  wait` works.
+- The instance metadata service answers at 169.254.169.254 (IMDSv1 and
+  IMDSv2 tokens): instance ID, type, addresses, placement, public keys,
+  tags, user data and the identity document. Each PC serves its own
+  instances, and a VM can't forge another's address to read its data.
 - cloud-init gets the key pair, user data and a static address. Each
   compute PC hands its instances addresses from its own /24 in 10.128.0.0/9,
   routed over the WireGuard mesh, and NATs their traffic to the internet.
@@ -124,7 +129,7 @@ ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
   Making one pauses the guest for the copy (create-image without
   `--no-reboot` shuts it down and restarts it, as EC2 does).
 - Compute PCs need `qemu-system-x86_64`, `qemu-img`, `genisoimage` (or
-  `mkisofs`/`xorriso`), `iproute2` and `iptables`. `jyd -emulate` runs guests
+  `mkisofs`/`xorriso`), `iproute2`, `iptables` and `ebtables`. `jyd -emulate` runs guests
   without KVM, very slowly, for trying things out.
 
 ## Try it
@@ -202,8 +207,8 @@ M2:
   every instance can reach every other instance on the mesh.
 - Instances on a PC that dies are not restarted elsewhere (M4).
 - Public IPs (M5); instances are reached from PCs on the mesh.
-- GetConsoleOutput, instance metadata service (169.254.169.254), spot,
-  launch templates.
+- Spot, launch templates, IAM instance profiles (the metadata service has
+  no credentials to hand out yet).
 
 M1:
 

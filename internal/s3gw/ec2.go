@@ -6,10 +6,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/pem"
 	"encoding/xml"
 	"errors"
@@ -20,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -52,6 +51,7 @@ type EC2Meta interface {
 	DeleteSnapshot(ctx context.Context, tenant, id string) (*s3meta.Object, error)
 	Snapshots(ctx context.Context, tenant string, ids []string) ([]ec2meta.Snapshot, error)
 	CreateImage(ctx context.Context, req ec2meta.CreateImageRequest) (*ec2meta.Image, error)
+	Console(ctx context.Context, tenant, id string) (*ec2meta.ConsoleOutput, error)
 }
 
 const ec2NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
@@ -235,6 +235,17 @@ func (g *Gateway) serveEC2(q *request) error {
 			XMLName xml.Name `xml:"x"`
 			ID      string   `xml:"imageId"`
 		}{ID: img.ID})
+	case "GetConsoleOutput":
+		c, err := g.EC2.Console(q.ctx, q.tenant, p.Get("InstanceId"))
+		if err != nil {
+			return err
+		}
+		return g.ec2Reply(q, "GetConsoleOutputResponse", struct {
+			XMLName   xml.Name `xml:"x"`
+			ID        string   `xml:"instanceId"`
+			Timestamp string   `xml:"timestamp"`
+			Output    string   `xml:"output,omitempty"`
+		}{ID: c.InstanceID, Timestamp: c.Timestamp.UTC().Format(time.RFC3339), Output: base64.StdEncoding.EncodeToString(c.Output)})
 	case "":
 		return ec2Err("MissingAction", "no Action given")
 	default:
@@ -284,10 +295,7 @@ func (g *Gateway) ec2Fail(q *request, e *Error) {
 }
 
 // ownerID is a stable 12-digit account number for a tenant.
-func ownerID(tenant string) string {
-	h := sha256.Sum256([]byte("jy-owner:" + tenant))
-	return fmt.Sprintf("%012d", binary.BigEndian.Uint64(h[:8])%1_000_000_000_000)
-}
+func ownerID(tenant string) string { return ec2meta.AccountID(tenant) }
 
 func (g *Gateway) zone() string { return g.region() + "a" }
 

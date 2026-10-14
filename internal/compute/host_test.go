@@ -3,6 +3,7 @@ package compute
 import (
 	"context"
 	"io"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -14,13 +15,14 @@ import (
 )
 
 type fakeControl struct {
-	mu      sync.Mutex
-	view    ec2meta.HostView
-	reports []ec2meta.StatusReport
-	fetches int
-	volReps []ec2meta.VolumeReport
-	failed  []ec2meta.TaskFailure
-	uploads map[string]string
+	mu       sync.Mutex
+	view     ec2meta.HostView
+	reports  []ec2meta.StatusReport
+	fetches  int
+	volReps  []ec2meta.VolumeReport
+	failed   []ec2meta.TaskFailure
+	uploads  map[string]string
+	consoles map[string]string
 }
 
 func (f *fakeControl) ReportVolume(_ context.Context, r ec2meta.VolumeReport) error {
@@ -84,6 +86,16 @@ func (f *fakeControl) dropTask(id string) {
 			return
 		}
 	}
+}
+
+func (f *fakeControl) SendConsole(_ context.Context, c ec2meta.ConsoleOutput) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.consoles == nil {
+		f.consoles = map[string]string{}
+	}
+	f.consoles[c.InstanceID] = string(c.Output)
+	return nil
 }
 
 func (f *fakeControl) FetchSnapshot(_ context.Context, id string, w io.Writer) error {
@@ -474,5 +486,83 @@ func TestVolumesAndTasks(t *testing.T) {
 	step()
 	if len(ctl.failed) != 1 || ctl.failed[0].ID != "task-3" {
 		t.Fatalf("failed %v", ctl.failed)
+	}
+}
+
+func TestMetadataService(t *testing.T) {
+	h := &Host{Region: "eu-west-1"}
+	m, err := newMetadataServer(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := ec2meta.Instance{ID: "i-0123456789abcdef0", Tenant: "alice", ImageID: "ami-1", Type: "t3.small",
+		PrivateIP: "10.128.0.10", MAC: "02:00:00:00:00:01", KeyName: "me", PublicKey: "ssh-ed25519 AAAA me",
+		UserData: []byte("#!/bin/sh\necho hi\n"), ReservationID: "r-1"}
+	h.byIP = map[string]ec2meta.Instance{in.PrivateIP: in}
+
+	do := func(method, path, from string, hdr map[string]string) (int, string) {
+		t.Helper()
+		r := httptest.NewRequest(method, path, nil)
+		r.RemoteAddr = from + ":40000"
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		m.ServeHTTP(w, r)
+		return w.Code, w.Body.String()
+	}
+	me := in.PrivateIP
+	for path, want := range map[string]string{
+		"/latest/meta-data/instance-id":               in.ID,
+		"/latest/meta-data/local-ipv4":                in.PrivateIP,
+		"/latest/meta-data/placement/region":          "eu-west-1",
+		"/latest/meta-data/public-keys/0/openssh-key": "ssh-ed25519 AAAA me\n",
+		"/latest/user-data":                           "#!/bin/sh\necho hi\n",
+		"/latest/meta-data/placement/":                "availability-zone\navailability-zone-id\nregion",
+		"/2021-03-23/meta-data/ami-id":                "ami-1",
+		"/latest/":                                    "dynamic/\nmeta-data/\nuser-data",
+		"/latest/meta-data/network/interfaces/macs/":  "02:00:00:00:00:01/",
+		"/latest/meta-data/public-keys/":              "0=me",
+		"/latest/meta-data/public-keys/0":             "openssh-key",
+	} {
+		if code, body := do("GET", path, me, nil); code != 200 || body != want {
+			t.Errorf("%s: %d %q, want %q", path, code, body, want)
+		}
+	}
+	if code, body := do("GET", "/latest/meta-data/", me, nil); code != 200 || !strings.Contains(body, "instance-id\n") || !strings.Contains(body, "public-keys/") {
+		t.Errorf("listing: %d %q", code, body)
+	}
+	if code, body := do("GET", "/latest/dynamic/instance-identity/document", me, nil); code != 200 || !strings.Contains(body, `"accountId": "`+ec2meta.AccountID("alice")+`"`) {
+		t.Errorf("identity: %d %s", code, body)
+	}
+	if code, _ := do("GET", "/latest/meta-data/instance-id", "10.128.0.99", nil); code != 403 {
+		t.Errorf("unknown address got %d", code)
+	}
+	if code, _ := do("GET", "/latest/meta-data/nope", me, nil); code != 404 {
+		t.Errorf("missing path got %d", code)
+	}
+
+	// IMDSv2.
+	code, tok := do("PUT", "/latest/api/token", me, map[string]string{tokenTTLHeader: "60"})
+	if code != 200 || tok == "" {
+		t.Fatalf("token: %d %q", code, tok)
+	}
+	if code, body := do("GET", "/latest/meta-data/instance-id", me, map[string]string{tokenHeader: tok}); code != 200 || body != in.ID {
+		t.Errorf("with token: %d %q", code, body)
+	}
+	if code, _ := do("GET", "/latest/meta-data/instance-id", me, map[string]string{tokenHeader: tok + "x"}); code != 401 {
+		t.Errorf("bad token got %d", code)
+	}
+	other := in
+	other.ID, other.PrivateIP = "i-other", "10.128.0.11"
+	h.byIP[other.PrivateIP] = other
+	if code, _ := do("GET", "/latest/meta-data/instance-id", other.PrivateIP, map[string]string{tokenHeader: tok}); code != 401 {
+		t.Errorf("another instance's token got %d", code)
+	}
+	if code, _ := do("PUT", "/latest/api/token", me, nil); code != 400 {
+		t.Errorf("token without TTL got %d", code)
+	}
+	if code, _ := do("PUT", "/latest/api/token", me, map[string]string{tokenTTLHeader: "60", "X-Forwarded-For": "1.2.3.4"}); code != 403 {
+		t.Errorf("proxied token request got %d", code)
 	}
 }

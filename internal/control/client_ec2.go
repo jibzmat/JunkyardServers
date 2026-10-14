@@ -318,3 +318,18 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
+
+// Console returns an instance's latest console output.
+func (c *Client) Console(ctx context.Context, tenant, id string) (*ec2meta.ConsoleOutput, error) {
+	var out ec2meta.ConsoleOutput
+	if err := c.call(ctx, http.MethodPost, "/v1/ec2/console", ec2meta.InstancesRequest{Tenant: tenant, IDs: []string{id}}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SendConsole sends an instance's console output from its host.
+func (c *Client) SendConsole(ctx context.Context, out ec2meta.ConsoleOutput) error {
+	var resp struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/host/console", out, &resp)
+}
