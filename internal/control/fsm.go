@@ -24,6 +24,8 @@ type ControlInfo struct {
 	ID       string `json:"id"`
 	APIAddr  string `json:"api_addr"`
 	RaftAddr string `json:"raft_addr"`
+	// ShareKey is the X25519 key this node's share of the KEK is sealed to.
+	ShareKey []byte `json:"share_key,omitempty"`
 }
 
 // state is the replicated control-plane record. Every control node holds a
@@ -41,6 +43,8 @@ type state struct {
 	Buckets    map[string]*s3meta.Bucket            `json:"buckets"`
 	Objects    map[string]map[string]*s3meta.Object `json:"objects"` // bucket -> key -> object
 	Uploads    map[string]*s3meta.Upload            `json:"uploads"` // multipart uploads by ID
+
+	KEK *kekState `json:"kek,omitempty"`
 }
 
 func newState() *state {
@@ -99,6 +103,9 @@ const (
 	opAbortUpload    = "abort_upload"
 
 	opMoveShards = "move_shards"
+
+	opPutKEK      = "put_kek"
+	opSetShareKey = "set_share_key"
 )
 
 type command struct {
@@ -123,6 +130,10 @@ type command struct {
 	UploadID string                 `json:"upload_id,omitempty"`
 	Part     *s3meta.Part           `json:"part,omitempty"`
 	Parts    []s3meta.CompletedPart `json:"parts,omitempty"`
+
+	KEK      *kekState         `json:"kek,omitempty"`
+	KEKEpoch int               `json:"kek_epoch,omitempty"`
+	Sealed   map[string][]byte `json:"sealed,omitempty"` // tenant -> master key sealed by the new KEK
 
 	SegmentID string             `json:"segment_id,omitempty"`
 	Moves     []s3meta.ShardMove `json:"moves,omitempty"`
@@ -331,7 +342,37 @@ func (f *fsm) applyObject(c command) (*s3meta.Object, error) {
 func (f *fsm) apply(c command) error {
 	st := f.st
 	switch c.Op {
+	case opPutKEK:
+		cur := 0
+		if st.KEK != nil {
+			cur = st.KEK.Epoch
+		}
+		if c.KEK.Epoch != cur+1 || len(c.Sealed) != len(st.Tenants) {
+			return errStaleKEK
+		}
+		for name := range st.Tenants {
+			if _, ok := c.Sealed[name]; !ok {
+				return errStaleKEK
+			}
+		}
+		for name, t := range st.Tenants {
+			cp := *t
+			cp.SealedKey, cp.MasterKey = c.Sealed[name], nil
+			st.Tenants[name] = &cp
+		}
+		st.KEK = c.KEK
+	case opSetShareKey:
+		old, ok := st.Controls[c.Control.ID]
+		if !ok {
+			return errors.New("control: unknown control node")
+		}
+		cp := *old
+		cp.ShareKey = c.Control.ShareKey
+		st.Controls[cp.ID] = &cp
 	case opPutTenant:
+		if st.KEK == nil || c.KEKEpoch != st.KEK.Epoch {
+			return errStaleKEK
+		}
 		if _, ok := st.Tenants[c.Tenant.Name]; ok {
 			return s3meta.Errorf(s3meta.CodeTenantExists, "tenant %q exists", c.Tenant.Name)
 		}

@@ -46,8 +46,16 @@ the control plane registry.
 - k+m is chosen from the number of live storage nodes: 4+2 with 6 or more,
   down to 1+1 with two. A chunk counts as written with k+1 shards stored.
 - Key hierarchy: object keys are wrapped with AES-256-GCM by the tenant's
-  master key; master keys live in the control plane's Raft state and never
-  leave it. Gateways ask the control plane to wrap and unwrap.
+  master key. Master keys are kept in the Raft state sealed by a cluster
+  key-encryption key (KEK) and never leave the control plane; gateways ask it
+  to wrap and unwrap.
+- The KEK is never stored. The leader Shamir-splits it, majority threshold,
+  across the Raft voters, sealing each share to that node's X25519 key
+  (share.key, local only); the sealed shares and a check value are in Raft.
+  A control node opens its own share and fetches the rest from peers over
+  mutual TLS. The leader rotates the KEK, re-sealing every tenant key in the
+  same Raft write, whenever the voter set changes. Tenants created before
+  this existed are sealed on the next rotation.
 - Metadata (tenants, access keys, buckets, objects with shard layouts,
   multipart uploads) lives in the Raft state machine. Overwrites and deletes
   return the old record so the gateway deletes its shards.

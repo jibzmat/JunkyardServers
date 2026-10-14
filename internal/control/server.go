@@ -78,6 +78,13 @@ type Server struct {
 
 	closeOnce sync.Once
 	closeErr  error
+	done      chan struct{}
+
+	// Key protection (kek.go).
+	sharePub, sharePriv *[32]byte
+	kekMu               sync.Mutex
+	kek                 []byte
+	kekEpoch            int
 }
 
 // AdminCredentials is the certificate an operator's jyctl uses.
@@ -140,6 +147,14 @@ func Init(dir, clusterName, apiAddr, raftAddr string, logger *log.Logger) (*Serv
 		s.Close()
 		return nil, nil, err
 	}
+	// Register this node's share key and create the first KEK now, so
+	// tenants can be created as soon as Init returns.
+	for i := 0; i < 3 && !s.KeysUnlocked(); i++ {
+		if err := s.keyStep(); err != nil {
+			s.Close()
+			return nil, nil, err
+		}
+	}
 
 	apub, apriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -183,20 +198,28 @@ func open(dir string, bootstrap bool, logger *log.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	sharePub, sharePriv, err := loadShareKey(dir)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
-		dir:     dir,
-		info:    info,
-		ca:      ca,
-		tlsCert: pki.TLSCertificate(cert.Raw, key, ca.Cert),
-		prefix:  netip.MustParsePrefix(MeshCIDR),
-		logger:  logger,
-		fsm:     newFSM(),
-		now:     time.Now,
+		sharePub:  sharePub,
+		sharePriv: sharePriv,
+		done:      make(chan struct{}),
+		dir:       dir,
+		info:      info,
+		ca:        ca,
+		tlsCert:   pki.TLSCertificate(cert.Raw, key, ca.Cert),
+		prefix:    netip.MustParsePrefix(MeshCIDR),
+		logger:    logger,
+		fsm:       newFSM(),
+		now:       time.Now,
 	}
 	if err := s.startRaft(bootstrap); err != nil {
 		s.Close()
 		return nil, err
 	}
+	go s.keyLoop()
 	return s, nil
 }
 
@@ -249,6 +272,7 @@ func (s *Server) startRaft(bootstrap bool) error {
 // Close stops this control node. It is safe to call more than once.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
+		close(s.done)
 		var errs []error
 		if s.raft != nil {
 			// Shutdown also closes the transport and its listener.
@@ -368,6 +392,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/controls/activate", s.requireKind(s.leaderOnly(s.handleControlActivate), pki.KindControl))
 	mux.HandleFunc("DELETE /v1/controls/{id}", s.requireKind(s.leaderOnly(s.handleControlRemove), pki.KindAdmin))
 	s.s3Routes(mux)
+	s.keyRoutes(mux)
 	return mux
 }
 

@@ -1,7 +1,6 @@
 package control
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"errors"
@@ -51,10 +50,21 @@ func (s *Server) CreateTenant(name string) (*s3meta.TenantResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	kek, epoch := s.currentKEK(), s.currentEpoch()
+	if kek == nil {
+		return nil, ErrKeysLocked
+	}
+	sealed, err := sealValue(kek, mk, tenantAD(name))
+	if err != nil {
+		return nil, err
+	}
 	err = s.apply(command{
 		Op:        opPutTenant,
-		Tenant:    &s3meta.Tenant{Name: name, MasterKey: mk, Created: s.now().UTC()},
+		Tenant:    &s3meta.Tenant{Name: name, SealedKey: sealed, Created: s.now().UTC()},
 		AccessKey: &s3meta.AccessKey{ID: id, Secret: secret, Tenant: name},
+		KEKEpoch:  epoch,
 	})
 	if err != nil {
 		return nil, err
@@ -110,20 +120,11 @@ func (s *Server) UnwrapKey(tenant string, wrapped []byte) ([]byte, error) {
 func wrapAD(tenant string) []byte { return []byte("jy-wrap-v1:" + tenant) }
 
 func (s *Server) tenantAEAD(tenant string) (cipher.AEAD, error) {
-	var mk []byte
-	s.fsm.view(func(st *state) {
-		if t, ok := st.Tenants[tenant]; ok {
-			mk = t.MasterKey
-		}
-	})
-	if mk == nil {
-		return nil, s3meta.Errorf(s3meta.CodeInvalidAccessKey, "unknown tenant")
-	}
-	block, err := aes.NewCipher(mk)
+	mk, err := s.tenantKey(tenant)
 	if err != nil {
 		return nil, err
 	}
-	return cipher.NewGCM(block)
+	return gcm(mk)
 }
 
 // ListBuckets lists a tenant's buckets by name.
@@ -672,8 +673,8 @@ func (s *Server) handleObjectList(w http.ResponseWriter, r *http.Request) {
 func metaError(w http.ResponseWriter, err error) {
 	var me *s3meta.Error
 	if !errors.As(err, &me) {
-		if errors.Is(err, ErrNotLeader) {
-			httpError(w, http.StatusServiceUnavailable, "leader changed; retry")
+		if errors.Is(err, ErrNotLeader) || errors.Is(err, ErrKeysLocked) || errors.Is(err, errStaleKEK) {
+			httpError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		httpError(w, http.StatusBadRequest, err.Error())

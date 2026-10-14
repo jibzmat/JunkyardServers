@@ -35,13 +35,13 @@ func freeAddr(t *testing.T) string {
 }
 
 // serve starts the API for srv on its API address.
-func serve(t *testing.T, srv *Server) {
+func serve(t *testing.T, srv *Server) *httptest.Server {
 	t.Helper()
 	ln, err := net.Listen("tcp", srv.APIAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	serveOn(t, srv, ln)
+	return serveOn(t, srv, ln)
 }
 
 // listen reserves a port and keeps it, so parallel tests can't take it.
@@ -54,7 +54,7 @@ func listen(t *testing.T) net.Listener {
 	return ln
 }
 
-func serveOn(t *testing.T, srv *Server, ln net.Listener) {
+func serveOn(t *testing.T, srv *Server, ln net.Listener) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewUnstartedServer(srv.Handler())
 	ts.Listener.Close()
@@ -62,6 +62,7 @@ func serveOn(t *testing.T, srv *Server, ln net.Listener) {
 	ts.TLS = srv.TLSConfig()
 	ts.StartTLS()
 	t.Cleanup(ts.Close)
+	return ts
 }
 
 func newTestCluster(t *testing.T) *testCluster {

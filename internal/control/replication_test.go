@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +17,13 @@ import (
 // addControl joins a trusted node with the control role, enrolls it as a
 // control node, starts it and waits until it is a Raft voter.
 func addControl(t *testing.T, c *testCluster) *Server {
+	t.Helper()
+	srv, _ := addControlServer(t, c)
+	return srv
+}
+
+// addControlServer is addControl that also returns the API server.
+func addControlServer(t *testing.T, c *testCluster) (*Server, *httptest.Server) {
 	t.Helper()
 	req, keys := joinReq(t, cluster.RoleControl, cluster.RoleStorage)
 	resp, err := Join(context.Background(), c.token(t, true), req)
@@ -41,14 +49,14 @@ func addControl(t *testing.T, c *testCluster) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	serve(t, srv)
+	ts := serve(t, srv)
 
 	ctl := NewClient(srv.Peers(), srv.ClientCertificate(), srv.CA())
 	if err := ctl.ActivateControl(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "voter", srv.IsVoter)
-	return srv
+	return srv, ts
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {

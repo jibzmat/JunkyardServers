@@ -51,6 +51,12 @@ architecture and roadmap.
   shards named by their SHA-256.
 - Object keys are wrapped by a per-tenant master key held by the control
   plane, which also keeps buckets, objects and uploads in its Raft state.
+- Tenant master keys are stored sealed by a cluster key-encryption key that
+  is never written down: it is Shamir-split across the control nodes, a
+  majority of which rebuild it in memory at startup. Neither a Raft snapshot
+  nor one control node's disk is enough to read tenant keys (except with a
+  single control node). The key is rotated whenever control nodes are added
+  or removed.
 - The gateway checks SigV4 (headers, presigned URLs, signed and unsigned
   streaming uploads, checksums, Content-MD5) and legacy SigV2.
 - Supported: list/create/delete/head bucket, get bucket location, put, get
@@ -122,6 +128,7 @@ internal/storage/     object encryption, erasure coding, placement, shard server
 internal/s3meta/      S3 metadata types (tenants, buckets, objects, uploads)
 internal/s3gw/        S3 gateway: SigV4/SigV2, buckets, objects, multipart
 internal/repair/      rebuilds shards lost with storage PCs
+internal/shamir/      Shamir secret sharing
 internal/cluster/     shared types: roles, trust tiers
 internal/hw/          hardware detection
 ```
@@ -141,8 +148,6 @@ M1:
   are not cleaned up.
 - Objects written while PCs were down keep the thinner coding that fit the
   PCs left; repair restores missing shards but doesn't upgrade the coding.
-- Tenant master keys are held whole by every control node; splitting them
-  with Shamir's scheme is next.
 - The gateway-side encrypted listing index for large buckets. Listing works
   today from the control plane's state.
 - A gateway reads the control addresses it had at start; restart it after

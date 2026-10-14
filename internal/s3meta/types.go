@@ -20,8 +20,12 @@ func ValidBucketName(name string) bool {
 
 // Tenant owns buckets. Its master key wraps every object's data key.
 type Tenant struct {
-	Name      string    `json:"name"`
-	MasterKey []byte    `json:"master_key"` // AES-256
+	Name string `json:"name"`
+	// SealedKey is the AES-256 master key sealed by the cluster's
+	// key-encryption key. MasterKey holds it in the clear only for tenants
+	// created before key protection, until the next key rotation.
+	SealedKey []byte    `json:"sealed_key,omitempty"`
+	MasterKey []byte    `json:"master_key,omitempty"`
 	Created   time.Time `json:"created"`
 }
 
