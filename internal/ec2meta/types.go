@@ -6,8 +6,6 @@ package ec2meta
 import (
 	"sort"
 	"time"
-
-	"github.com/jibzmat/JunkyardServers/internal/s3meta"
 )
 
 // Placement says which hosts may run an instance. See docs/design.md.
@@ -155,17 +153,137 @@ type Image struct {
 	Public      bool              `json:"public,omitempty"`
 	Created     time.Time         `json:"created"`
 	Tags        map[string]string `json:"tags,omitempty"`
-	Segment     s3meta.Segment    `json:"segment"`
+	// State is pending while CreateImage copies an instance's disk, then
+	// available (or failed). Empty means available.
+	State  string `json:"state,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// SourceInstance is the instance CreateImage made it from.
+	SourceInstance string `json:"source_instance,omitempty"`
+}
+
+// Image states.
+const (
+	ImagePending   = "pending"
+	ImageAvailable = "available"
+	ImageFailed    = "failed"
+)
+
+// Available reports whether instances can be launched from the image.
+func (i Image) Available() bool { return i.State == "" || i.State == ImageAvailable }
+
+// StateName is the image's state as EC2 names it.
+func (i Image) StateName() string {
+	if i.State == "" {
+		return ImageAvailable
+	}
+	return i.State
+}
+
+// Volume is a block device an instance can attach (EBS's API). Its data
+// lives on one compute PC, chosen when it is first attached; snapshots
+// copy it into the cluster's encrypted, erasure-coded storage, and a new
+// volume can be made from a snapshot on any PC.
+type Volume struct {
+	ID         string            `json:"id"`
+	Tenant     string            `json:"tenant"`
+	SizeGiB    int               `json:"size_gib"`
+	SnapshotID string            `json:"snapshot_id,omitempty"`
+	Type       string            `json:"type"`
+	State      string            `json:"state"` // available, in-use, deleting
+	Created    time.Time         `json:"created"`
+	Tags       map[string]string `json:"tags,omitempty"`
+
+	// Host is the PC holding the data; empty until first attached.
+	Host string `json:"host,omitempty"`
+	// Ready is set once the host has created the data (blank, or restored
+	// from the snapshot).
+	Ready bool `json:"ready,omitempty"`
+
+	Instance    string    `json:"instance,omitempty"`
+	Device      string    `json:"device,omitempty"`
+	AttachState string    `json:"attach_state,omitempty"` // attaching, attached, detaching
+	AttachTime  time.Time `json:"attach_time,omitempty"`
+}
+
+// Volume and attachment states.
+const (
+	VolumeAvailable = "available"
+	VolumeInUse     = "in-use"
+	VolumeDeleting  = "deleting"
+	VolumeDeleted   = "deleted"
+
+	AttachAttaching = "attaching"
+	AttachAttached  = "attached"
+	AttachDetaching = "detaching"
+	AttachDetached  = "detached"
+)
+
+// Snapshot is a point-in-time copy of a volume.
+type Snapshot struct {
+	ID          string            `json:"id"`
+	Tenant      string            `json:"tenant"`
+	VolumeID    string            `json:"volume_id"`
+	SizeGiB     int               `json:"size_gib"`
+	Description string            `json:"description,omitempty"`
+	State       string            `json:"state"` // pending, completed, error
+	Reason      string            `json:"reason,omitempty"`
+	Created     time.Time         `json:"created"`
+	Tags        map[string]string `json:"tags,omitempty"`
+}
+
+// Snapshot states.
+const (
+	SnapshotPending   = "pending"
+	SnapshotCompleted = "completed"
+	SnapshotError     = "error"
+)
+
+// Task is work a compute host does for the control plane: copying an
+// instance's root disk into an image, or a volume into a snapshot. The
+// host streams the bytes to the control plane, which stores them.
+type Task struct {
+	ID       string    `json:"id"`
+	Kind     string    `json:"kind"` // image or snapshot
+	Tenant   string    `json:"tenant"`
+	Host     string    `json:"host"`
+	Instance string    `json:"instance,omitempty"` // image: whose root disk
+	Volume   string    `json:"volume,omitempty"`   // snapshot: which volume
+	Target   string    `json:"target"`             // the ami- or snap- being made
+	NoReboot bool      `json:"no_reboot,omitempty"`
+	Created  time.Time `json:"created"`
+}
+
+// Task kinds.
+const (
+	TaskImage    = "image"
+	TaskSnapshot = "snapshot"
+)
+
+// VolumeReport is a host reporting a volume's progress.
+type VolumeReport struct {
+	ID          string `json:"id"`
+	Ready       bool   `json:"ready,omitempty"`
+	AttachState string `json:"attach_state,omitempty"` // attached or detached
+	Deleted     bool   `json:"deleted,omitempty"`
+}
+
+// TaskFailure is a host reporting a task it couldn't do.
+type TaskFailure struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
 }
 
 // HostSubnetBits is the size of the subnet each compute host's instances
 // get addresses from.
 const HostSubnetBits = 24
 
-// HostView is what a compute host fetches: its instances and its subnet.
+// HostView is what a compute host fetches: its subnet, instances,
+// volumes and tasks.
 type HostView struct {
 	Subnet    string     `json:"subnet"` // e.g. 10.128.3.0/24; empty until first scheduled
 	Instances []Instance `json:"instances"`
+	Volumes   []Volume   `json:"volumes,omitempty"`
+	Tasks     []Task     `json:"tasks,omitempty"`
 }
 
 // StatusReport is a host reporting an instance's actual state.
@@ -231,6 +349,31 @@ type TagsRequest struct {
 	Delete    bool              `json:"delete,omitempty"`
 }
 
+// VolumeRequest names volumes; no IDs means all of the tenant's.
+type VolumeRequest struct {
+	Tenant string   `json:"tenant"`
+	IDs    []string `json:"ids,omitempty"`
+}
+
+// AttachRequest attaches or detaches a volume.
+type AttachRequest struct {
+	Tenant   string `json:"tenant"`
+	Volume   string `json:"volume"`
+	Instance string `json:"instance,omitempty"`
+	Device   string `json:"device,omitempty"`
+	Force    bool   `json:"force,omitempty"`
+}
+
+// CreateImageRequest makes an image from an instance's root disk.
+type CreateImageRequest struct {
+	Tenant      string            `json:"tenant"`
+	Instance    string            `json:"instance"`
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	NoReboot    bool              `json:"no_reboot,omitempty"`
+	Tags        map[string]string `json:"tags,omitempty"`
+}
+
 // Error codes, as EC2 names them.
 const (
 	CodeInvalidInstanceID = "InvalidInstanceID.NotFound"
@@ -241,4 +384,7 @@ const (
 	CodeIncorrectState    = "IncorrectInstanceState"
 	CodeInsufficientCap   = "InsufficientInstanceCapacity"
 	CodeUnsupported       = "Unsupported"
+	CodeVolumeNotFound    = "InvalidVolume.NotFound"
+	CodeVolumeInUse       = "VolumeInUse"
+	CodeSnapshotNotFound  = "InvalidSnapshot.NotFound"
 )

@@ -105,6 +105,20 @@ the control plane registry.
 - Networking: each compute host gets a /24 of 10.128.0.0/9 on first use,
   served on a bridge (host = .1), routed to it over WireGuard (the subnet is
   in the peer's AllowedIPs) and NATed for traffic leaving the cluster.
+- Volumes: a qcow2 file on one compute host, chosen when the volume is
+  first attached (the instance's host); attachments are attaching →
+  attached → detaching, moved along by host reports. Hosts give each VM 8
+  PCIe root ports and hotplug volumes with QMP (`blockdev-add`,
+  `device_add`), serial = volume ID. Detach waits for the guest to release
+  the device.
+- Snapshots and CreateImage are tasks in the Raft state for the host holding
+  the disk. The host pauses the VM (which flushes its writes), copies the
+  disk to a standalone qcow2, resumes, and streams it to a control node,
+  which stores it as an object in the hidden `_snapshots` or `_images`
+  bucket and completes the task. Tasks on a host gone for 2 minutes fail.
+- A host destroys VMs it no longer sees only after a minute, and the control
+  plane serves host views only once a leader has applied the whole log, so
+  a restart can't make a host wipe its VMs.
 
 ## Roadmap
 

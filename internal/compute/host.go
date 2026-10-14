@@ -24,6 +24,16 @@ type VM struct {
 	Instance ec2meta.Instance
 	Subnet   string // the host's instance subnet
 	Dir      string // disk, seed, console log, QMP socket, PID file
+	// Volumes are the volumes attached, attaching or detaching.
+	Volumes []ec2meta.Volume
+	// Disks are the volumes to boot with, set by the host before Start.
+	Disks []Disk
+}
+
+// Disk is a volume's data file on this host.
+type Disk struct {
+	ID   string
+	Path string
 }
 
 // Driver runs VMs. QEMU is the real one.
@@ -36,6 +46,19 @@ type Driver interface {
 	Stop(ctx context.Context, vm *VM, graceful bool) error
 	Reboot(vm *VM) error
 	Destroy(ctx context.Context, vm *VM) error
+
+	// CreateDisk makes a volume's data file: blank, or from a snapshot's
+	// qcow2 when from is set, grown to sizeGiB.
+	CreateDisk(ctx context.Context, path string, sizeGiB int, from string) error
+	// Attached lists the volumes plugged into a running VM.
+	Attached(vm *VM) ([]string, error)
+	// Attach hotplugs a volume into a running VM.
+	Attach(ctx context.Context, vm *VM, d Disk) error
+	// Detach unplugs a volume; it fails while the guest still holds it.
+	Detach(ctx context.Context, vm *VM, id string) error
+	// Capture copies a disk to a standalone qcow2. A running VM is paused
+	// for the copy, so the data is consistent as of one instant.
+	Capture(ctx context.Context, vm *VM, src, dst string) error
 }
 
 // Control is what the host needs from the control plane; *control.Client
@@ -44,6 +67,10 @@ type Control interface {
 	HostView(ctx context.Context) (*ec2meta.HostView, error)
 	ReportInstance(ctx context.Context, r ec2meta.StatusReport) error
 	FetchImage(ctx context.Context, id string, w io.Writer) (string, error)
+	ReportVolume(ctx context.Context, r ec2meta.VolumeReport) error
+	FailTask(ctx context.Context, f ec2meta.TaskFailure) error
+	UploadTask(ctx context.Context, id string, open func() (io.ReadCloser, int64, error)) error
+	FetchSnapshot(ctx context.Context, id string, w io.Writer) error
 }
 
 // Host reconciles this PC's VMs with the control plane.
@@ -57,12 +84,19 @@ type Host struct {
 	busy     map[string]bool
 	failed   map[string]time.Time // instance -> last failed start
 	images   map[string]*sync.Mutex
+	volumes  map[string]*sync.Mutex
+	done     map[string]time.Time // tasks finished here, until the view drops them
+	missing  map[string]time.Time // VM dirs not in the view, since when
 	subnet   string
 	inflight sync.WaitGroup
 }
 
 // retryAfter is how long a failed start waits before the next try.
 const retryAfter = 30 * time.Second
+
+// destroyAfter is how long a VM must be missing from the view before it is
+// destroyed, so one bad view can't wipe a host.
+const destroyAfter = time.Minute
 
 func (h *Host) logf(format string, args ...any) {
 	if h.Logger != nil {
@@ -112,20 +146,53 @@ func (h *Host) Step(ctx context.Context) error {
 		h.subnet = v.Subnet
 		h.mu.Unlock()
 	}
+	attached := map[string][]ec2meta.Volume{}
+	for _, vol := range v.Volumes {
+		if vol.Instance != "" {
+			attached[vol.Instance] = append(attached[vol.Instance], vol)
+		}
+	}
+	tasks := h.volumeWork(ctx, v)
 	assigned := map[string]bool{}
 	for _, in := range v.Instances {
 		assigned[in.ID] = true
-		vm := &VM{Instance: in, Subnet: v.Subnet, Dir: h.instanceDir(in.ID)}
-		h.spawn(ctx, in.ID, func(ctx context.Context) { h.reconcile(ctx, vm) })
+		vm := &VM{Instance: in, Subnet: v.Subnet, Dir: h.instanceDir(in.ID), Volumes: attached[in.ID]}
+		todo := tasks[in.ID]
+		h.spawn(ctx, in.ID, func(ctx context.Context) {
+			h.reconcile(ctx, vm)
+			for _, t := range todo {
+				h.runTask(ctx, t, vm)
+			}
+		})
 	}
 	// VMs no longer assigned here (purged, or moved off a host thought
 	// lost) are destroyed.
 	entries, _ := os.ReadDir(filepath.Join(h.Dir, "instances"))
+	h.mu.Lock()
+	if h.missing == nil {
+		h.missing = map[string]time.Time{}
+	}
+	seen := map[string]bool{}
+	var gone []string
 	for _, e := range entries {
 		id := e.Name()
 		if assigned[id] || !strings.HasPrefix(id, "i-") {
 			continue
 		}
+		seen[id] = true
+		if since, ok := h.missing[id]; !ok {
+			h.missing[id] = time.Now()
+		} else if time.Since(since) >= destroyAfter {
+			gone = append(gone, id)
+		}
+	}
+	for id := range h.missing {
+		if !seen[id] {
+			delete(h.missing, id)
+		}
+	}
+	h.mu.Unlock()
+	for _, id := range gone {
 		vm := &VM{Instance: ec2meta.Instance{ID: id}, Dir: h.instanceDir(id)}
 		h.spawn(ctx, id, func(ctx context.Context) { h.destroy(ctx, vm) })
 	}
@@ -199,6 +266,7 @@ func (h *Host) reconcile(ctx context.Context, vm *VM) {
 		delete(h.failed, in.ID)
 		h.mu.Unlock()
 		h.report(ctx, in.ID, ec2meta.StateRunning, "")
+		h.syncVolumes(ctx, vm, true)
 
 	case ec2meta.StateRunning:
 		if !h.Driver.Running(vm) {
@@ -214,6 +282,7 @@ func (h *Host) reconcile(ctx context.Context, vm *VM) {
 			}
 			writeSeq(vm, in.RebootSeq)
 		}
+		h.syncVolumes(ctx, vm, true)
 
 	case ec2meta.StateStopping:
 		if err := h.Driver.Stop(ctx, vm, true); err != nil {
@@ -221,11 +290,13 @@ func (h *Host) reconcile(ctx context.Context, vm *VM) {
 			return
 		}
 		h.report(ctx, in.ID, ec2meta.StateStopped, "Client.UserInitiatedShutdown: User initiated shutdown")
+		h.syncVolumes(ctx, vm, false)
 
 	case ec2meta.StateStopped:
 		if h.Driver.Running(vm) {
 			_ = h.Driver.Stop(ctx, vm, false)
 		}
+		h.syncVolumes(ctx, vm, false)
 
 	case ec2meta.StateShuttingDown:
 		if h.destroy(ctx, vm) {
@@ -255,6 +326,22 @@ func (h *Host) start(ctx context.Context, vm *VM) error {
 		return err
 	}
 	writeSeq(vm, vm.Instance.RebootSeq)
+	return h.boot(ctx, vm)
+}
+
+// boot starts a prepared VM with its attached volumes.
+func (h *Host) boot(ctx context.Context, vm *VM) error {
+	vm.Disks = nil
+	for _, v := range vm.Volumes {
+		if v.AttachState != ec2meta.AttachAttaching && v.AttachState != ec2meta.AttachAttached {
+			continue
+		}
+		path, err := h.volume(ctx, v)
+		if err != nil {
+			return err
+		}
+		vm.Disks = append(vm.Disks, Disk{ID: v.ID, Path: path})
+	}
 	return h.Driver.Start(ctx, vm)
 }
 

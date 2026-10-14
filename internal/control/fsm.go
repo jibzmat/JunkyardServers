@@ -187,7 +187,9 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	case opRecode:
 		err = f.applyRecode(c)
 	case opRunInstances, opInstanceAction, opAssign, opUnassign, opInstanceReport, opPurgeInstances,
-		opPutKeyPair, opDeleteKeyPair, opPutImage, opDeleteImage, opTags:
+		opPutKeyPair, opDeleteKeyPair, opPutImage, opDeleteImage, opTags,
+		opCreateVolume, opDeleteVolume, opAttachVolume, opDetachVolume, opVolumeReport,
+		opCreateSnapshot, opDeleteSnapshot, opCreateImage, opTaskDone, opTaskFailed:
 		res, err = f.applyEC2(c)
 	default:
 		return f.apply(c)

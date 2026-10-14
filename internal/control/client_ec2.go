@@ -118,14 +118,15 @@ func (c *Client) FetchImage(ctx context.Context, id string, w io.Writer) (format
 	hc := *c.http
 	hc.Timeout = 0 // images are large; ctx bounds the download
 	var errs []error
+	cw := &countingWriter{w: w}
 	for _, a := range c.Addrs() {
-		format, err := fetchImage(ctx, &hc, "https://"+a+"/v1/ec2/host/images/"+id, w)
+		format, err := fetchImage(ctx, &hc, "https://"+a+"/v1/ec2/host/images/"+id, cw)
 		if err == nil {
 			return format, nil
 		}
 		var he *httpErr
-		if errors.As(err, &he) && he.code != http.StatusServiceUnavailable {
-			return "", err
+		if cw.n > 0 || (errors.As(err, &he) && he.code != http.StatusServiceUnavailable) {
+			return "", err // part written, or a real refusal: don't retry
 		}
 		errs = append(errs, err)
 	}
@@ -154,4 +155,166 @@ func fetchImage(ctx context.Context, hc *http.Client, url string, w io.Writer) (
 		return "", fmt.Errorf("control: image %d of %d bytes", n, resp.ContentLength)
 	}
 	return resp.Header.Get("X-Image-Format"), nil
+}
+
+// Volumes, snapshots and CreateImage (gateways).
+
+// CreateVolume makes a volume.
+func (c *Client) CreateVolume(ctx context.Context, tenant string, v ec2meta.Volume) (*ec2meta.Volume, error) {
+	v.Tenant = tenant
+	var out ec2meta.Volume
+	if err := c.call(ctx, http.MethodPost, "/v1/ec2/volumes/create", v, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteVolume deletes a volume.
+func (c *Client) DeleteVolume(ctx context.Context, tenant, id string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/volumes/delete", ec2meta.VolumeRequest{Tenant: tenant, IDs: []string{id}}, &out)
+}
+
+// AttachVolume attaches a volume to an instance.
+func (c *Client) AttachVolume(ctx context.Context, req ec2meta.AttachRequest) (*ec2meta.Volume, error) {
+	var out ec2meta.Volume
+	if err := c.call(ctx, http.MethodPost, "/v1/ec2/volumes/attach", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DetachVolume detaches a volume.
+func (c *Client) DetachVolume(ctx context.Context, req ec2meta.AttachRequest) (*ec2meta.Volume, error) {
+	var out ec2meta.Volume
+	if err := c.call(ctx, http.MethodPost, "/v1/ec2/volumes/detach", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Volumes lists a tenant's volumes, or the ones named.
+func (c *Client) Volumes(ctx context.Context, tenant string, ids []string) ([]ec2meta.Volume, error) {
+	var out []ec2meta.Volume
+	err := c.call(ctx, http.MethodPost, "/v1/ec2/volumes/list", ec2meta.VolumeRequest{Tenant: tenant, IDs: ids}, &out)
+	return out, err
+}
+
+// CreateSnapshot starts a snapshot of a volume.
+func (c *Client) CreateSnapshot(ctx context.Context, tenant, volume, description string, tags map[string]string) (*ec2meta.Snapshot, error) {
+	var out ec2meta.Snapshot
+	req := createSnapshotRequest{Tenant: tenant, Volume: volume, Description: description, Tags: tags}
+	if err := c.call(ctx, http.MethodPost, "/v1/ec2/snapshots/create", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteSnapshot deletes a snapshot and returns the object whose shards
+// the caller should delete.
+func (c *Client) DeleteSnapshot(ctx context.Context, tenant, id string) (*s3meta.Object, error) {
+	var out s3meta.ObjectResponse
+	err := c.call(ctx, http.MethodPost, "/v1/ec2/snapshots/delete", ec2meta.VolumeRequest{Tenant: tenant, IDs: []string{id}}, &out)
+	return out.Object, err
+}
+
+// Snapshots lists a tenant's snapshots, or the ones named.
+func (c *Client) Snapshots(ctx context.Context, tenant string, ids []string) ([]ec2meta.Snapshot, error) {
+	var out []ec2meta.Snapshot
+	err := c.call(ctx, http.MethodPost, "/v1/ec2/snapshots/list", ec2meta.VolumeRequest{Tenant: tenant, IDs: ids}, &out)
+	return out, err
+}
+
+// CreateImage starts making an image from an instance.
+func (c *Client) CreateImage(ctx context.Context, req ec2meta.CreateImageRequest) (*ec2meta.Image, error) {
+	var out ec2meta.Image
+	if err := c.call(ctx, http.MethodPost, "/v1/ec2/images/create", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Host calls for volumes and tasks.
+
+// ReportVolume tells the control plane a volume's progress.
+func (c *Client) ReportVolume(ctx context.Context, r ec2meta.VolumeReport) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/host/volume-report", r, &out)
+}
+
+// FailTask reports a task the host couldn't do.
+func (c *Client) FailTask(ctx context.Context, f ec2meta.TaskFailure) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/host/task-failed", f, &out)
+}
+
+// UploadTask streams a task's disk to the control plane. open is called
+// for each attempt (a redirect to the leader resends the body).
+func (c *Client) UploadTask(ctx context.Context, id string, open func() (io.ReadCloser, int64, error)) error {
+	hc := *c.http
+	hc.Timeout = 0
+	var errs []error
+	for _, a := range c.Addrs() {
+		body, size, err := open()
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, "https://"+a+"/v1/ec2/host/tasks/"+id, body)
+		if err != nil {
+			body.Close()
+			return err
+		}
+		req.ContentLength = size
+		req.GetBody = func() (io.ReadCloser, error) {
+			b, _, err := open()
+			return b, err
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+		he := &httpErr{code: resp.StatusCode, msg: string(msg)}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			return he
+		}
+		errs = append(errs, he)
+	}
+	return errors.Join(errs...)
+}
+
+// FetchSnapshot streams a snapshot's bytes (qcow2) to w.
+func (c *Client) FetchSnapshot(ctx context.Context, id string, w io.Writer) error {
+	hc := *c.http
+	hc.Timeout = 0
+	var errs []error
+	cw := &countingWriter{w: w}
+	for _, a := range c.Addrs() {
+		_, err := fetchImage(ctx, &hc, "https://"+a+"/v1/ec2/host/snapshots/"+id, cw)
+		if err == nil {
+			return nil
+		}
+		var he *httpErr
+		if cw.n > 0 || (errors.As(err, &he) && he.code != http.StatusServiceUnavailable) {
+			return err
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }

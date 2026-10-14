@@ -57,17 +57,23 @@ const (
 )
 
 type ec2Command struct {
-	Instances []ec2meta.Instance    `json:"instances,omitempty"`
-	IDs       []string              `json:"ids,omitempty"`
-	Action    string                `json:"action,omitempty"`
-	Host      string                `json:"host,omitempty"`
-	IP        string                `json:"ip,omitempty"`
-	MAC       string                `json:"mac,omitempty"`
-	Report    *ec2meta.StatusReport `json:"report,omitempty"`
-	KeyPair   *ec2meta.KeyPair      `json:"key_pair,omitempty"`
-	Image     *ec2meta.Image        `json:"image,omitempty"`
-	Object    *s3meta.Object        `json:"object,omitempty"`
-	Tags      *ec2meta.TagsRequest  `json:"tags,omitempty"`
+	Instances []ec2meta.Instance     `json:"instances,omitempty"`
+	IDs       []string               `json:"ids,omitempty"`
+	Action    string                 `json:"action,omitempty"`
+	Host      string                 `json:"host,omitempty"`
+	IP        string                 `json:"ip,omitempty"`
+	MAC       string                 `json:"mac,omitempty"`
+	Report    *ec2meta.StatusReport  `json:"report,omitempty"`
+	KeyPair   *ec2meta.KeyPair       `json:"key_pair,omitempty"`
+	Volume    *ec2meta.Volume        `json:"volume,omitempty"`
+	Snapshot  *ec2meta.Snapshot      `json:"snapshot,omitempty"`
+	Task      *ec2meta.Task          `json:"task,omitempty"`
+	Attach    *ec2meta.AttachRequest `json:"attach,omitempty"`
+	VolReport *ec2meta.VolumeReport  `json:"vol_report,omitempty"`
+	Failure   *ec2meta.TaskFailure   `json:"failure,omitempty"`
+	Image     *ec2meta.Image         `json:"image,omitempty"`
+	Object    *s3meta.Object         `json:"object,omitempty"`
+	Tags      *ec2meta.TagsRequest   `json:"tags,omitempty"`
 }
 
 // ec2State is the EC2 part of the replicated state.
@@ -75,6 +81,9 @@ type ec2State struct {
 	Instances map[string]*ec2meta.Instance `json:"instances"`
 	KeyPairs  map[string]*ec2meta.KeyPair  `json:"key_pairs"` // tenant + "/" + name
 	Images    map[string]*ec2meta.Image    `json:"images"`
+	Volumes   map[string]*ec2meta.Volume   `json:"volumes"`
+	Snapshots map[string]*ec2meta.Snapshot `json:"snapshots"`
+	Tasks     map[string]*ec2meta.Task     `json:"tasks"`
 	// NextSubnet is the index of the next host subnet to hand out.
 	NextSubnet int `json:"next_subnet"`
 }
@@ -88,6 +97,15 @@ func (e *ec2State) fill() {
 	}
 	if e.Images == nil {
 		e.Images = map[string]*ec2meta.Image{}
+	}
+	if e.Volumes == nil {
+		e.Volumes = map[string]*ec2meta.Volume{}
+	}
+	if e.Snapshots == nil {
+		e.Snapshots = map[string]*ec2meta.Snapshot{}
+	}
+	if e.Tasks == nil {
+		e.Tasks = map[string]*ec2meta.Task{}
 	}
 }
 
@@ -108,7 +126,7 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		if len(x.Instances) == 0 {
 			return nil, errCode(ec2meta.CodeInvalidParameter, "no instances")
 		}
-		if img, ok := e.Images[x.Instances[0].ImageID]; !ok || !(img.Tenant == c.Owner || img.Public) {
+		if img, ok := e.Images[x.Instances[0].ImageID]; !ok || !(img.Tenant == c.Owner || img.Public) || !img.Available() {
 			return nil, errCode(ec2meta.CodeInvalidAMIID, "image %s does not exist", x.Instances[0].ImageID)
 		}
 		for i := range x.Instances {
@@ -184,8 +202,10 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		case ec2meta.StatePending:
 			n.Host, n.PrivateIP, n.MAC = "", "", ""
 			n.StateReason = x.Action
+			detachAll(e, n.ID) // its volumes stay on the lost PC
 		case ec2meta.StateShuttingDown:
 			n.State, n.Changed, n.StateReason = ec2meta.StateTerminated, c.Now, x.Action
+			detachAll(e, n.ID)
 		case ec2meta.StateStopping:
 			n.State, n.Changed, n.StateReason = ec2meta.StateStopped, c.Now, x.Action
 		default:
@@ -209,6 +229,9 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		}
 		n.StateReason = r.Reason
 		e.Instances[n.ID] = &n
+		if n.State == ec2meta.StateTerminated {
+			detachAll(e, n.ID)
+		}
 		return nil, nil
 
 	case opPurgeInstances:
@@ -260,6 +283,11 @@ func (f *fsm) applyEC2(c command) (any, error) {
 			return nil, errCode(ec2meta.CodeInvalidAMIID, "the image id '[%s]' does not exist", x.Image.ID)
 		}
 		delete(e.Images, img.ID)
+		for id, t := range e.Tasks {
+			if t.Target == img.ID {
+				delete(e.Tasks, id)
+			}
+		}
 		old, _ := f.st.Objects[imageBucket].get(img.ID)
 		f.st.Objects[imageBucket].del(img.ID)
 		return old, nil
@@ -276,7 +304,7 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		}
 		return nil, nil
 	}
-	return nil, errUnknownOp
+	return f.applyEC2Storage(c)
 }
 
 // instanceAction applies a tenant's stop, start, terminate or reboot.
@@ -400,6 +428,12 @@ func hasResource(e *ec2State, tenant, id string) bool {
 				return true
 			}
 		}
+	case strings.HasPrefix(id, "vol-"):
+		v, ok := e.Volumes[id]
+		return ok && v.Tenant == tenant
+	case strings.HasPrefix(id, "snap-"):
+		sn, ok := e.Snapshots[id]
+		return ok && sn.Tenant == tenant
 	}
 	return false
 }
@@ -435,6 +469,14 @@ func setTags(e *ec2State, tenant, id string, tags map[string]string, del bool) {
 		n := *e.Images[id]
 		n.Tags = mergeTags(n.Tags, tags, del)
 		e.Images[id] = &n
+	case strings.HasPrefix(id, "vol-"):
+		n := *e.Volumes[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.Volumes[id] = &n
+	case strings.HasPrefix(id, "snap-"):
+		n := *e.Snapshots[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.Snapshots[id] = &n
 	case strings.HasPrefix(id, "key-"):
 		for name, k := range e.KeyPairs {
 			if k.ID == id && k.Tenant == tenant {
@@ -490,6 +532,10 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 		img, ok := st.EC2.Images[t.ImageID]
 		if !ok || !(img.Tenant == tenant || img.Public) {
 			err = errCode(ec2meta.CodeInvalidAMIID, "the image id '[%s]' does not exist", t.ImageID)
+			return
+		}
+		if !img.Available() {
+			err = errCode("InvalidAMIID.Unavailable", "the image %s is %s", t.ImageID, img.StateName())
 			return
 		}
 		if t.KeyName != "" {
@@ -868,7 +914,7 @@ func (s *Server) schedule() error {
 			return err
 		}
 	}
-	return nil
+	return s.failLostTasks(isAlive)
 }
 
 // macFor derives a locally administered MAC address from an instance ID.
@@ -891,7 +937,19 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 				v.Instances = append(v.Instances, *in)
 			}
 		}
+		for _, vol := range st.EC2.Volumes {
+			if vol.Host == host {
+				v.Volumes = append(v.Volumes, *vol)
+			}
+		}
+		for _, t := range st.EC2.Tasks {
+			if t.Host == host {
+				v.Tasks = append(v.Tasks, *t)
+			}
+		}
 	})
+	sort.Slice(v.Volumes, func(i, j int) bool { return v.Volumes[i].ID < v.Volumes[j].ID })
+	sort.Slice(v.Tasks, func(i, j int) bool { return v.Tasks[i].ID < v.Tasks[j].ID })
 	sort.Slice(v.Instances, func(i, j int) bool { return v.Instances[i].ID < v.Instances[j].ID })
 	return v
 }
@@ -961,7 +1019,7 @@ func (s *Server) ec2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/ec2/tags", gw(s.handleTags))
 
 	host := func(h http.HandlerFunc) http.HandlerFunc { return s.requireKind(h, pki.KindNode) }
-	mux.HandleFunc("GET /v1/ec2/host", host(s.handleHostView))
+	mux.HandleFunc("GET /v1/ec2/host", host(s.leaderOnly(s.handleHostView)))
 	mux.HandleFunc("POST /v1/ec2/host/report", host(s.leaderOnly(s.handleHostReport)))
 	mux.HandleFunc("GET /v1/ec2/host/images/{id}", host(s.handleHostImage))
 }
@@ -1115,6 +1173,10 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHostView(w http.ResponseWriter, r *http.Request) {
+	if err := s.caughtUp(); err != nil {
+		httpError(w, http.StatusServiceUnavailable, "the control plane is catching up; retry")
+		return
+	}
 	writeJSON(w, s.HostView(certName(r)))
 }
 

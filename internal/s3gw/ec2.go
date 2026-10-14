@@ -42,6 +42,16 @@ type EC2Meta interface {
 	DeleteImage(ctx context.Context, tenant, id string) (*s3meta.Object, error)
 	Images(ctx context.Context, tenant string, ids []string) ([]ec2meta.Image, error)
 	Tags(ctx context.Context, req ec2meta.TagsRequest) error
+
+	CreateVolume(ctx context.Context, tenant string, v ec2meta.Volume) (*ec2meta.Volume, error)
+	DeleteVolume(ctx context.Context, tenant, id string) error
+	AttachVolume(ctx context.Context, req ec2meta.AttachRequest) (*ec2meta.Volume, error)
+	DetachVolume(ctx context.Context, req ec2meta.AttachRequest) (*ec2meta.Volume, error)
+	Volumes(ctx context.Context, tenant string, ids []string) ([]ec2meta.Volume, error)
+	CreateSnapshot(ctx context.Context, tenant, volume, description string, tags map[string]string) (*ec2meta.Snapshot, error)
+	DeleteSnapshot(ctx context.Context, tenant, id string) (*s3meta.Object, error)
+	Snapshots(ctx context.Context, tenant string, ids []string) ([]ec2meta.Snapshot, error)
+	CreateImage(ctx context.Context, req ec2meta.CreateImageRequest) (*ec2meta.Image, error)
 }
 
 const ec2NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
@@ -189,6 +199,42 @@ func (g *Gateway) serveEC2(q *request) error {
 			return err
 		}
 		return g.ec2Return(q, p.Get("Action")+"Response")
+	case "CreateVolume":
+		return g.createVolume(q, p)
+	case "DeleteVolume":
+		if err := g.EC2.DeleteVolume(q.ctx, q.tenant, p.Get("VolumeId")); err != nil {
+			return err
+		}
+		return g.ec2Return(q, "DeleteVolumeResponse")
+	case "AttachVolume", "DetachVolume":
+		return g.attachVolume(q, p)
+	case "DescribeVolumes":
+		return g.describeVolumes(q, p)
+	case "CreateSnapshot":
+		return g.createSnapshot(q, p)
+	case "DeleteSnapshot":
+		old, err := g.EC2.DeleteSnapshot(q.ctx, q.tenant, p.Get("SnapshotId"))
+		if err != nil {
+			return err
+		}
+		if old != nil {
+			g.discard(old.Segments()...)
+		}
+		return g.ec2Return(q, "DeleteSnapshotResponse")
+	case "DescribeSnapshots":
+		return g.describeSnapshots(q, p)
+	case "CreateImage":
+		img, err := g.EC2.CreateImage(q.ctx, ec2meta.CreateImageRequest{
+			Tenant: q.tenant, Instance: p.Get("InstanceId"), Name: p.Get("Name"), Description: p.Get("Description"),
+			NoReboot: p.Get("NoReboot") == "true", Tags: emptyNil(p.tagSpecs("image")),
+		})
+		if err != nil {
+			return err
+		}
+		return g.ec2Reply(q, "CreateImageResponse", struct {
+			XMLName xml.Name `xml:"x"`
+			ID      string   `xml:"imageId"`
+		}{ID: img.ID})
 	case "":
 		return ec2Err("MissingAction", "no Action given")
 	default:
@@ -289,19 +335,30 @@ type instanceXML struct {
 	Monitoring struct {
 		State string `xml:"state"`
 	} `xml:"monitoring"`
-	PrivateIP          string     `xml:"privateIpAddress,omitempty"`
-	Architecture       string     `xml:"architecture"`
-	RootDeviceType     string     `xml:"rootDeviceType"`
-	RootDeviceName     string     `xml:"rootDeviceName"`
-	VirtualizationType string     `xml:"virtualizationType"`
-	Hypervisor         string     `xml:"hypervisor"`
-	ClientToken        string     `xml:"clientToken,omitempty"`
-	Tags               []tagXML   `xml:"tagSet>item"`
-	StateReason        *reasonXML `xml:"stateReason,omitempty"`
+	PrivateIP          string           `xml:"privateIpAddress,omitempty"`
+	Architecture       string           `xml:"architecture"`
+	RootDeviceType     string           `xml:"rootDeviceType"`
+	RootDeviceName     string           `xml:"rootDeviceName"`
+	VirtualizationType string           `xml:"virtualizationType"`
+	Hypervisor         string           `xml:"hypervisor"`
+	ClientToken        string           `xml:"clientToken,omitempty"`
+	Tags               []tagXML         `xml:"tagSet>item"`
+	StateReason        *reasonXML       `xml:"stateReason,omitempty"`
+	BlockDevices       []blockDeviceXML `xml:"blockDeviceMapping>item"`
 	CPU                struct {
 		CoreCount      int `xml:"coreCount"`
 		ThreadsPerCore int `xml:"threadsPerCore"`
 	} `xml:"cpuOptions"`
+}
+
+type blockDeviceXML struct {
+	Device string `xml:"deviceName"`
+	EBS    struct {
+		VolumeID            string `xml:"volumeId"`
+		Status              string `xml:"status"`
+		AttachTime          string `xml:"attachTime"`
+		DeleteOnTermination bool   `xml:"deleteOnTermination"`
+	} `xml:"ebs"`
 }
 
 type reasonXML struct {
@@ -528,6 +585,10 @@ func (g *Gateway) describeInstances(q *request, p ec2Params) error {
 		return err
 	}
 	filters := p.filters()
+	vols, err := g.EC2.Volumes(q.ctx, q.tenant, nil)
+	if err != nil {
+		return err
+	}
 	type reservation struct {
 		ID        string        `xml:"reservationId"`
 		OwnerID   string        `xml:"ownerId"`
@@ -546,7 +607,16 @@ func (g *Gateway) describeInstances(q *request, p ec2Params) error {
 			index[in.ReservationID] = i
 			out = append(out, reservation{ID: in.ReservationID, OwnerID: ownerID(q.tenant)})
 		}
-		out[i].Instances = append(out[i].Instances, g.instanceXML(in))
+		x := g.instanceXML(in)
+		for _, v := range vols {
+			if v.Instance == in.ID {
+				var m blockDeviceXML
+				m.Device = v.Device
+				m.EBS.VolumeID, m.EBS.Status, m.EBS.AttachTime = v.ID, v.AttachState, iso(v.AttachTime)
+				x.BlockDevices = append(x.BlockDevices, m)
+			}
+		}
+		out[i].Instances = append(out[i].Instances, x)
 	}
 	return g.ec2Reply(q, "DescribeInstancesResponse", struct {
 		XMLName      xml.Name      `xml:"x"`
@@ -855,8 +925,11 @@ func (g *Gateway) describeImages(q *request, p ec2Params) error {
 		if v, ok := filters["image-id"]; ok && !anyMatch([]string{img.ID}, v) {
 			continue
 		}
+		if v, ok := filters["state"]; ok && !anyMatch([]string{img.StateName()}, v) {
+			continue
+		}
 		out = append(out, imageXML{
-			ID: img.ID, Location: img.Location, State: "available", OwnerID: owner, Created: iso(img.Created),
+			ID: img.ID, Location: img.Location, State: img.StateName(), OwnerID: owner, Created: iso(img.Created),
 			Public: img.Public, Architecture: "x86_64", Type: "machine", Name: img.Name, Description: img.Description,
 			RootType: "instance-store", RootName: "/dev/vda", Virt: "hvm", Hypervisor: "kvm", Tags: tagSet(img.Tags),
 		})
@@ -865,4 +938,179 @@ func (g *Gateway) describeImages(q *request, p ec2Params) error {
 		XMLName xml.Name   `xml:"x"`
 		Images  []imageXML `xml:"imagesSet>item"`
 	}{Images: out})
+}
+
+// --- Volumes and snapshots ---
+
+type attachmentXML struct {
+	VolumeID            string `xml:"volumeId"`
+	InstanceID          string `xml:"instanceId"`
+	Device              string `xml:"device"`
+	Status              string `xml:"status"`
+	AttachTime          string `xml:"attachTime"`
+	DeleteOnTermination bool   `xml:"deleteOnTermination"`
+}
+
+type volumeXML struct {
+	ID          string          `xml:"volumeId"`
+	Size        int             `xml:"size"`
+	SnapshotID  string          `xml:"snapshotId"`
+	Zone        string          `xml:"availabilityZone"`
+	Status      string          `xml:"status"`
+	Created     string          `xml:"createTime"`
+	Attachments []attachmentXML `xml:"attachmentSet>item"`
+	Tags        []tagXML        `xml:"tagSet>item"`
+	Type        string          `xml:"volumeType"`
+	Encrypted   bool            `xml:"encrypted"`
+	MultiAttach bool            `xml:"multiAttachEnabled"`
+}
+
+func (g *Gateway) volumeXML(v ec2meta.Volume) volumeXML {
+	x := volumeXML{ID: v.ID, Size: v.SizeGiB, SnapshotID: v.SnapshotID, Zone: g.zone(), Status: v.State,
+		Created: iso(v.Created), Tags: tagSet(v.Tags), Type: v.Type}
+	if v.Instance != "" {
+		x.Attachments = []attachmentXML{{v.ID, v.Instance, v.Device, v.AttachState, iso(v.AttachTime), false}}
+	}
+	return x
+}
+
+func (g *Gateway) createVolume(q *request, p ec2Params) error {
+	v := ec2meta.Volume{SnapshotID: p.Get("SnapshotId"), Type: p.Get("VolumeType"), Tags: emptyNil(p.tagSpecs("volume"))}
+	if sz := p.Get("Size"); sz != "" {
+		n, err := strconv.Atoi(sz)
+		if err != nil {
+			return ec2Err(ec2meta.CodeInvalidParameter, "bad size %q", sz)
+		}
+		v.SizeGiB = n
+	}
+	if v.Type == "" {
+		v.Type = "gp3"
+	}
+	out, err := g.EC2.CreateVolume(q.ctx, q.tenant, v)
+	if err != nil {
+		return err
+	}
+	x := g.volumeXML(*out)
+	return g.ec2Reply(q, "CreateVolumeResponse", struct {
+		XMLName xml.Name `xml:"x"`
+		volumeXML
+	}{volumeXML: x})
+}
+
+func (g *Gateway) attachVolume(q *request, p ec2Params) error {
+	req := ec2meta.AttachRequest{Tenant: q.tenant, Volume: p.Get("VolumeId"), Instance: p.Get("InstanceId"), Device: p.Get("Device"), Force: p.Get("Force") == "true"}
+	var v *ec2meta.Volume
+	var err error
+	name := p.Get("Action") + "Response"
+	if p.Get("Action") == "AttachVolume" {
+		v, err = g.EC2.AttachVolume(q.ctx, req)
+	} else {
+		v, err = g.EC2.DetachVolume(q.ctx, req)
+	}
+	if err != nil {
+		return err
+	}
+	return g.ec2Reply(q, name, struct {
+		XMLName xml.Name `xml:"x"`
+		attachmentXML
+	}{attachmentXML: attachmentXML{v.ID, v.Instance, v.Device, v.AttachState, iso(v.AttachTime), false}})
+}
+
+func (g *Gateway) describeVolumes(q *request, p ec2Params) error {
+	vols, err := g.EC2.Volumes(q.ctx, q.tenant, p.list("VolumeId"))
+	if err != nil {
+		return err
+	}
+	filters := p.filters()
+	var out []volumeXML
+	for _, v := range vols {
+		ok := true
+		for name, vals := range filters {
+			var got []string
+			switch {
+			case name == "volume-id":
+				got = []string{v.ID}
+			case name == "status":
+				got = []string{v.State}
+			case name == "attachment.instance-id":
+				got = []string{v.Instance}
+			case name == "attachment.status":
+				got = []string{v.AttachState}
+			case name == "snapshot-id":
+				got = []string{v.SnapshotID}
+			case strings.HasPrefix(name, "tag:"):
+				if t, has := v.Tags[name[4:]]; has {
+					got = []string{t}
+				}
+			default:
+				continue
+			}
+			if !anyMatch(got, vals) {
+				ok = false
+			}
+		}
+		if ok {
+			out = append(out, g.volumeXML(v))
+		}
+	}
+	return g.ec2Reply(q, "DescribeVolumesResponse", struct {
+		XMLName xml.Name    `xml:"x"`
+		Volumes []volumeXML `xml:"volumeSet>item"`
+	}{Volumes: out})
+}
+
+type snapshotXML struct {
+	ID          string   `xml:"snapshotId"`
+	VolumeID    string   `xml:"volumeId"`
+	Status      string   `xml:"status"`
+	StatusMsg   string   `xml:"statusMessage,omitempty"`
+	StartTime   string   `xml:"startTime"`
+	Progress    string   `xml:"progress"`
+	OwnerID     string   `xml:"ownerId"`
+	VolumeSize  int      `xml:"volumeSize"`
+	Description string   `xml:"description"`
+	Encrypted   bool     `xml:"encrypted"`
+	Tags        []tagXML `xml:"tagSet>item"`
+}
+
+func (g *Gateway) snapshotXML(s ec2meta.Snapshot) snapshotXML {
+	progress := "0%"
+	if s.State == ec2meta.SnapshotCompleted {
+		progress = "100%"
+	}
+	return snapshotXML{ID: s.ID, VolumeID: s.VolumeID, Status: s.State, StatusMsg: s.Reason, StartTime: iso(s.Created),
+		Progress: progress, OwnerID: ownerID(s.Tenant), VolumeSize: s.SizeGiB, Description: s.Description, Encrypted: true, Tags: tagSet(s.Tags)}
+}
+
+func (g *Gateway) createSnapshot(q *request, p ec2Params) error {
+	s, err := g.EC2.CreateSnapshot(q.ctx, q.tenant, p.Get("VolumeId"), p.Get("Description"), emptyNil(p.tagSpecs("snapshot")))
+	if err != nil {
+		return err
+	}
+	return g.ec2Reply(q, "CreateSnapshotResponse", struct {
+		XMLName xml.Name `xml:"x"`
+		snapshotXML
+	}{snapshotXML: g.snapshotXML(*s)})
+}
+
+func (g *Gateway) describeSnapshots(q *request, p ec2Params) error {
+	snaps, err := g.EC2.Snapshots(q.ctx, q.tenant, p.list("SnapshotId"))
+	if err != nil {
+		return err
+	}
+	filters := p.filters()
+	var out []snapshotXML
+	for _, s := range snaps {
+		if v, ok := filters["volume-id"]; ok && !anyMatch([]string{s.VolumeID}, v) {
+			continue
+		}
+		if v, ok := filters["status"]; ok && !anyMatch([]string{s.State}, v) {
+			continue
+		}
+		out = append(out, g.snapshotXML(s))
+	}
+	return g.ec2Reply(q, "DescribeSnapshotsResponse", struct {
+		XMLName   xml.Name      `xml:"x"`
+		Snapshots []snapshotXML `xml:"snapshotSet>item"`
+	}{Snapshots: out})
 }

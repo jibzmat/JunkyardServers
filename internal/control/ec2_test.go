@@ -170,7 +170,8 @@ func TestLostHostReleasesInstances(t *testing.T) {
 	c, ami := ec2Setup(t)
 	host, _ := joinCompute(t, c, true, bigHost)
 	alive := true
-	c.srv.StartCompute(ComputeOptions{Alive: func() map[string]bool { return map[string]bool{host: alive} }})
+	// No scheduler loop: the test drives schedule() and changes the clock.
+	c.srv.compute = ComputeOptions{Alive: func() map[string]bool { return map[string]bool{host: alive} }}
 	r, err := c.srv.RunInstances("alice", ec2meta.RunRequest{Count: 1, Template: ec2meta.Instance{ImageID: ami, Type: "t3.micro"}})
 	if err != nil {
 		t.Fatal(err)

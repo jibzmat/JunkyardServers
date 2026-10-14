@@ -102,8 +102,10 @@ ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
   encrypted and erasure-coded like any object, and cached on each host.
 - Supported: run, describe (with filters), stop, start, reboot, terminate,
   describe-instance-status, key pairs (create, import, describe, delete),
-  register/describe/deregister images, tags, regions, zones and instance
-  types (t3, m5, c5, r5 sizes). `aws ec2 wait` works.
+  register/describe/deregister images, create-image from an instance,
+  volumes (create, attach, detach, delete, describe), snapshots (create,
+  delete, describe, and volumes restored from them), tags, regions, zones
+  and instance types (t3, m5, c5, r5 sizes). `aws ec2 wait` works.
 - cloud-init gets the key pair, user data and a static address. Each
   compute PC hands its instances addresses from its own /24 in 10.128.0.0/9,
   routed over the WireGuard mesh, and NATs their traffic to the internet.
@@ -111,8 +113,16 @@ ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
   `any` (strangers' PCs too) or `confidential` (SEV-SNP/TDX, once
   attestation lands). A launch no PC can take fails with
   InsufficientInstanceCapacity.
-- A shutdown from inside the guest stops the instance, as on EC2. Disks are
-  local to the PC (instance store); they survive stop and start.
+- A shutdown from inside the guest stops the instance, as on EC2. Root
+  disks are local to the PC; they survive stop and start.
+- Volumes attach and detach while the instance runs (PCIe hotplug, up to 8
+  per instance) and show up in the guest as
+  `/dev/disk/by-id/virtio-vol…`. A volume lives on the PC of the instance
+  it was first attached to; to move it, snapshot it and create a new
+  volume from the snapshot. Snapshots and images made with create-image
+  are stored in the cluster, encrypted and erasure-coded like objects.
+  Making one pauses the guest for the copy (create-image without
+  `--no-reboot` shuts it down and restarts it, as EC2 does).
 - Compute PCs need `qemu-system-x86_64`, `qemu-img`, `genisoimage` (or
   `mkisofs`/`xorriso`), `iproute2` and `iptables`. `jyd -emulate` runs guests
   without KVM, very slowly, for trying things out.
@@ -166,8 +176,8 @@ internal/agent/       jyd main loop
 internal/storage/     object encryption, erasure coding, placement, shard servers
 internal/s3meta/      S3 metadata types (tenants, buckets, objects, uploads)
 internal/s3gw/        S3 and EC2 gateway: SigV4/SigV2, buckets, objects, multipart, EC2 Query API
-internal/ec2meta/     EC2 records (instances, key pairs, images)
-internal/compute/     compute host: QEMU driver, cloud-init seed, VM networking
+internal/ec2meta/     EC2 records (instances, key pairs, images, volumes, snapshots)
+internal/compute/     compute host: QEMU driver, volumes, snapshots, cloud-init seed, VM networking
 internal/repair/      rebuilds shards lost with storage PCs
 internal/shamir/      Shamir secret sharing
 internal/cluster/     shared types: roles, trust tiers
@@ -184,8 +194,9 @@ go vet ./... && go test -race ./...
 
 M2:
 
-- EBS volumes (instances have local disks only), snapshots and AMIs made
-  from instances.
+- Volumes are a single copy on one PC; if that PC dies, the data since the
+  last snapshot is lost. Replicating them across PCs is M4 work. A volume
+  on a PC that never comes back can't be deleted yet.
 - SEV-SNP/TDX attestation, so `confidential` placement has no hosts yet.
 - Security groups and isolation between instances on one PC (M3); today
   every instance can reach every other instance on the mesh.

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -88,8 +89,11 @@ type Server struct {
 
 	// Compute (ec2.go).
 	computeMu sync.Mutex
-	compute   ComputeOptions
-	schedKick chan struct{}
+	// barrierTerm is the raft term in which this node last confirmed it
+	// had applied everything committed before it led.
+	barrierTerm atomic.Uint64
+	compute     ComputeOptions
+	schedKick   chan struct{}
 }
 
 // AdminCredentials is the certificate an operator's jyctl uses.
@@ -372,6 +376,21 @@ func (s *Server) leaderBarrier() error {
 	return nil
 }
 
+// caughtUp is leaderBarrier run once per term: a new leader may not have
+// applied the log yet, and reads that drive destructive work (a host
+// destroying VMs it no longer sees) must not see that partial state.
+func (s *Server) caughtUp() error {
+	term := s.raft.CurrentTerm()
+	if s.barrierTerm.Load() == term && s.IsLeader() {
+		return nil
+	}
+	if err := s.leaderBarrier(); err != nil {
+		return err
+	}
+	s.barrierTerm.Store(term)
+	return nil
+}
+
 // TLSConfig is the API's server-side TLS configuration. Client certificates
 // are optional at the TLS layer (a joining node has none yet) and required
 // per endpoint by the handlers.
@@ -399,6 +418,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/controls/{id}", s.requireKind(s.leaderOnly(s.handleControlRemove), pki.KindAdmin))
 	s.s3Routes(mux)
 	s.ec2Routes(mux)
+	s.ec2StorageRoutes(mux)
 	s.keyRoutes(mux)
 	return mux
 }

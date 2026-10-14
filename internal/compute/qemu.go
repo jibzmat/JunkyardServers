@@ -252,7 +252,156 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 		"-pidfile", filepath.Join(vm.Dir, "qemu.pid"),
 		"-daemonize",
 	}
+	// Volumes go on PCIe root ports, which support hotplug (the q35 root
+	// bus doesn't). Volumes attached at boot take the first ports.
+	for i := 1; i <= rootPorts; i++ {
+		args = append(args, "-device", fmt.Sprintf("pcie-root-port,id=rp%d,chassis=%d,bus=pcie.0", i, i))
+	}
+	if len(vm.Disks) > rootPorts {
+		return fmt.Errorf("compute: at most %d volumes per instance", rootPorts)
+	}
+	for i, d := range vm.Disks {
+		args = append(args,
+			"-blockdev", "driver=qcow2,node-name="+nodeName(d.ID)+",file.driver=file,file.filename="+d.Path,
+			"-device", volumeDevice(d.ID)+",bus="+fmt.Sprintf("rp%d", i+1)+",addr=0")
+	}
 	return run(ctx, q.binary(), args...)
+}
+
+// rootPorts is the number of hotplug slots, so the most volumes an
+// instance can have attached.
+const rootPorts = 8
+
+// nodeName and deviceID name a volume's block node and guest device.
+func nodeName(vol string) string { return "d-" + vol }
+func deviceID(vol string) string { return "v-" + vol }
+
+// volumeDevice is the virtio disk for a volume. Its serial is the volume
+// ID without the dash (20 characters, virtio's limit), as on EC2's NVMe
+// volumes, so the guest finds it at /dev/disk/by-id/virtio-vol....
+func volumeDevice(vol string) string {
+	return "virtio-blk-pci,drive=" + nodeName(vol) + ",id=" + deviceID(vol) + ",serial=" + strings.Replace(vol, "-", "", 1)
+}
+
+// CreateDisk makes a volume's qcow2: blank, or a copy of from (a
+// snapshot), grown to sizeGiB.
+func (q *QEMU) CreateDisk(ctx context.Context, path string, sizeGiB int, from string) error {
+	size := strconv.Itoa(sizeGiB) + "G"
+	if from == "" {
+		return run(ctx, "qemu-img", "create", "-q", "-f", "qcow2", path, size)
+	}
+	if err := run(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", from, path); err != nil {
+		return err
+	}
+	// A volume larger than its snapshot grows; never shrink.
+	_ = run(ctx, "qemu-img", "resize", "-q", path, size)
+	return nil
+}
+
+// Attached lists the volumes plugged into a running VM.
+func (q *QEMU) Attached(vm *VM) ([]string, error) {
+	out, err := qmpRun(vm, qmpCmd{"qom-list", map[string]any{"path": "/machine/peripheral"}})
+	if err != nil {
+		return nil, err
+	}
+	var props []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out[0], &props); err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, p := range props {
+		if id, ok := strings.CutPrefix(p.Name, "v-"); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// Attach hotplugs a volume into a free root port.
+func (q *QEMU) Attach(ctx context.Context, vm *VM, d Disk) error {
+	_, err := qmpRun(vm, qmpCmd{"blockdev-add", map[string]any{
+		"driver": "qcow2", "node-name": nodeName(d.ID),
+		"file": map[string]any{"driver": "file", "filename": d.Path},
+	}})
+	if err != nil && !strings.Contains(err.Error(), "Duplicate node name") {
+		return err // a node left from an earlier try is fine
+	}
+	for i := 1; i <= rootPorts; i++ {
+		_, err = qmpRun(vm, qmpCmd{"device_add", map[string]any{
+			"driver": "virtio-blk-pci", "drive": nodeName(d.ID), "id": deviceID(d.ID),
+			"serial": strings.Replace(d.ID, "-", "", 1), "bus": fmt.Sprintf("rp%d", i),
+			// A root port has one slot the guest scans; without this QEMU
+			// would put a second device on a busy port where it's unseen.
+			"addr": "0",
+		}})
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "not available") && !strings.Contains(err.Error(), "in use") && !strings.Contains(err.Error(), "full") {
+			break
+		}
+	}
+	_, _ = qmpRun(vm, qmpCmd{"blockdev-del", map[string]any{"node-name": nodeName(d.ID)}})
+	return fmt.Errorf("compute: no free slot for %s (at most %d volumes): %w", d.ID, rootPorts, err)
+}
+
+// Detach asks the guest to release a volume and, once it has, removes it.
+// The guest must cooperate (as on EC2, a volume in use may not detach
+// until it is unmounted); Detach fails until it does.
+func (q *QEMU) Detach(ctx context.Context, vm *VM, id string) error {
+	if _, err := qmpRun(vm, qmpCmd{"device_del", map[string]any{"id": deviceID(id)}}); err != nil &&
+		!strings.Contains(err.Error(), "in the process of unplug") && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		ids, err := q.Attached(vm)
+		if err != nil {
+			return err
+		}
+		gone := true
+		for _, a := range ids {
+			if a == id {
+				gone = false
+			}
+		}
+		if gone {
+			break
+		}
+		if time.Now().After(deadline) {
+			return errors.New("the guest has not released the volume yet")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	if _, err := qmpRun(vm, qmpCmd{"blockdev-del", map[string]any{"node-name": nodeName(id)}}); err != nil &&
+		!strings.Contains(err.Error(), "not found") {
+		return err
+	}
+	return nil
+}
+
+// Capture copies a disk to a standalone qcow2 (flattening any backing
+// image). A running VM is paused while it copies: pausing flushes its
+// writes, so the copy is consistent as of one instant, like a power cut.
+func (q *QEMU) Capture(ctx context.Context, vm *VM, src, dst string) error {
+	if vm != nil && q.Running(vm) {
+		if err := qmp(vm, "stop"); err != nil {
+			return err
+		}
+		defer func() {
+			if err := qmp(vm, "cont"); err != nil {
+				_ = qmp(vm, "cont") // retry once; a paused guest is worse than a slow one
+			}
+		}()
+	}
+	// -U: QEMU holds a lock on the file even while paused.
+	return run(ctx, "qemu-img", "convert", "-U", "-O", "qcow2", src, dst)
 }
 
 // pid returns the instance's QEMU process ID if it is running.
@@ -326,30 +475,43 @@ func (q *QEMU) Destroy(ctx context.Context, vm *VM) error {
 	return nil
 }
 
-// qmp sends one command over the instance's QMP socket.
+// qmp sends one command without arguments over the instance's QMP socket.
 func qmp(vm *VM, command string) error {
+	_, err := qmpRun(vm, qmpCmd{Execute: command})
+	return err
+}
+
+type qmpCmd struct {
+	Execute   string `json:"execute"`
+	Arguments any    `json:"arguments,omitempty"`
+}
+
+// qmpRun sends commands over the instance's QMP socket and returns their
+// results.
+func qmpRun(vm *VM, cmds ...qmpCmd) ([]json.RawMessage, error) {
 	c, err := net.DialTimeout("unix", filepath.Join(vm.Dir, "qmp.sock"), 2*time.Second)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
 	r := bufio.NewReader(c)
 	if _, err := r.ReadBytes('\n'); err != nil { // greeting
-		return err
+		return nil, err
 	}
 	enc := json.NewEncoder(c)
-	for _, cmd := range []string{"qmp_capabilities", command} {
-		if err := enc.Encode(map[string]string{"execute": cmd}); err != nil {
-			return err
+	var out []json.RawMessage
+	for i, cmd := range append([]qmpCmd{{Execute: "qmp_capabilities"}}, cmds...) {
+		if err := enc.Encode(cmd); err != nil {
+			return nil, err
 		}
 		for {
 			line, err := r.ReadBytes('\n')
 			if err != nil {
-				if cmd == "quit" {
-					return nil // QEMU exits before answering
+				if cmd.Execute == "quit" {
+					return out, nil // QEMU exits before answering
 				}
-				return err
+				return nil, err
 			}
 			var resp struct {
 				Return json.RawMessage `json:"return"`
@@ -361,15 +523,18 @@ func qmp(vm *VM, command string) error {
 				continue
 			}
 			if resp.Error != nil {
-				return fmt.Errorf("qmp %s: %s", cmd, resp.Error.Desc)
+				return nil, fmt.Errorf("qmp %s: %s", cmd.Execute, resp.Error.Desc)
 			}
 			if resp.Return != nil {
+				if i > 0 {
+					out = append(out, resp.Return)
+				}
 				break
 			}
 			// An event; keep reading.
 		}
 	}
-	return nil
+	return out, nil
 }
 
 var _ Driver = (*QEMU)(nil)
