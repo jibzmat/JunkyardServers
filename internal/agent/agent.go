@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -187,7 +188,10 @@ func (a *Agent) refresh(ctx context.Context) {
 		for _, c := range controls {
 			addrs = append(addrs, c.APIAddr)
 		}
-		a.client = control.NewClient(addrs, a.node.TLSCertificate(), a.node.CA)
+		if !slices.Equal(addrs, a.client.Addrs()) {
+			a.client.SetAddrs(addrs)
+			a.saveControls(addrs)
+		}
 	}
 	members, err := a.client.Members(rctx)
 	if err != nil || !containsNode(members, a.node.Config.NodeID) {
@@ -213,6 +217,26 @@ func (a *Agent) refresh(ctx context.Context) {
 		}
 	}
 	a.sync()
+}
+
+// Client is the agent's control-plane client. Its addresses follow control
+// nodes being added and removed, so other services on this node share it.
+func (a *Agent) Client() *control.Client {
+	return a.client
+}
+
+// saveControls records the control addresses so a restart reaches the
+// current control plane even if every node it joined through has left.
+func (a *Agent) saveControls(addrs []string) {
+	if a.node.Dir == "" {
+		return
+	}
+	cfg := a.node.Config
+	cfg.Controls = addrs
+	cfg.Control = addrs[0]
+	if err := node.SaveConfig(a.node.Dir, cfg); err != nil {
+		a.log.Printf("saving control addresses: %v", err)
+	}
 }
 
 func (a *Agent) sync() {

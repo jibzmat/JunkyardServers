@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
@@ -74,8 +75,27 @@ func verifyPinned(chain []*x509.Certificate, fingerprint string) error {
 // Client talks to the control plane with a cluster certificate. It tries each
 // control address in turn, and follows redirects to the leader.
 type Client struct {
+	mu    sync.Mutex
 	addrs []string
 	http  *http.Client
+}
+
+// SetAddrs replaces the control addresses, for when control nodes are
+// added or removed. An empty list is ignored.
+func (c *Client) SetAddrs(addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	c.addrs = append([]string(nil), addrs...)
+	c.mu.Unlock()
+}
+
+// Addrs returns the control addresses the client tries.
+func (c *Client) Addrs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.addrs...)
 }
 
 // NewClient builds a client that presents cert and trusts only caCert.
@@ -273,11 +293,12 @@ func (c *Client) ListUploads(ctx context.Context, tenant, bucket string) ([]s3me
 // control node (4xx) is returned at once; only transport failures and 503s
 // move on to the next address.
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
-	if len(c.addrs) == 0 {
+	addrs := c.Addrs()
+	if len(addrs) == 0 {
 		return errors.New("control: no control plane address")
 	}
 	var errs []error
-	for _, a := range c.addrs {
+	for _, a := range addrs {
 		err := do(ctx, c.http, method, "https://"+a+path, in, out)
 		if err == nil {
 			return nil

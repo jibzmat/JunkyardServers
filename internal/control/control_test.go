@@ -275,3 +275,17 @@ func TestAllocateIP(t *testing.T) {
 		t.Fatal("exhausted /30 still allocated")
 	}
 }
+
+func TestClientFollowsNewAddresses(t *testing.T) {
+	c := newTestCluster(t)
+	adminCert := pki.TLSCertificate(c.creds.CertDER, c.creds.Key, c.srv.CA())
+	cl := NewClient([]string{freeAddr(t)}, adminCert, c.srv.CA()) // nothing there
+	if _, err := cl.Members(context.Background()); err == nil {
+		t.Fatal("call to a dead address succeeded")
+	}
+	cl.SetAddrs(nil) // ignored
+	cl.SetAddrs([]string{c.addr})
+	if _, err := cl.Members(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

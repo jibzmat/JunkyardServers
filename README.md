@@ -150,8 +150,6 @@ M1:
   PCs left; repair restores missing shards but doesn't upgrade the coding.
 - The gateway-side encrypted listing index for large buckets. Listing works
   today from the control plane's state.
-- A gateway reads the control addresses it had at start; restart it after
-  adding or removing control nodes.
 
 From M0:
 

@@ -13,7 +13,6 @@ import (
 
 	"github.com/jibzmat/JunkyardServers/internal/agent"
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
-	"github.com/jibzmat/JunkyardServers/internal/control"
 	"github.com/jibzmat/JunkyardServers/internal/node"
 	"github.com/jibzmat/JunkyardServers/internal/pki"
 	"github.com/jibzmat/JunkyardServers/internal/s3gw"
@@ -78,7 +77,7 @@ func scrub(st *storage.ShardStore, logger *log.Logger) {
 // startGateway serves the S3 API.
 func startGateway(n *node.Node, a *agent.Agent, logger *log.Logger) (*http.Server, *s3gw.Gateway, error) {
 	gw := &s3gw.Gateway{
-		Meta: control.NewClient(n.Config.ControlAddrs(), n.TLSCertificate(), n.CA),
+		Meta: a.Client(), // follows control nodes being added and removed
 		Store: &storage.Store{
 			Client: storage.NewShardClient(n.TLSCertificate(), n.CA),
 			Nodes:  func() []storage.Node { return storageNodes(a) },

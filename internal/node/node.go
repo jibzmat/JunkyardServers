@@ -123,6 +123,19 @@ func Save(dir string, cfg Config, keys *Keys, certPEM, caPEM []byte) error {
 	return os.WriteFile(filepath.Join(dir, configFile), b, 0o600)
 }
 
+// SaveConfig rewrites just the config file in dir.
+func SaveConfig(dir string, cfg Config) error {
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, configFile+".tmp")
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, configFile))
+}
+
 // Load reads a node directory and checks the certificate chains to the CA.
 func Load(dir string) (*Node, error) {
 	b, err := os.ReadFile(filepath.Join(dir, configFile))
