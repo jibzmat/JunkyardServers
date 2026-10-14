@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,16 +20,14 @@ import (
 )
 
 // The instance metadata service. Guests reach it at 169.254.169.254:80,
-// which the host DNATs to MetadataPort on its bridge address. The host
-// answers from its own copy of its instances, so it works while the
-// control plane is unreachable. An instance is known by its source
-// address, which the host stops instances from forging (see antiSpoof).
+// which is on the loopback of their VPC's namespace; jyd listens there
+// through a socket opened inside the namespace, so a caller is known by its
+// VPC and source address (which the PC stops instances forging). It
+// answers from the host's own copy of its instances, so it works while the
+// control plane is unreachable.
 
 // MetadataIP is the address guests ask, as on EC2.
 const MetadataIP = "169.254.169.254"
-
-// MetadataPort is where the host serves metadata on its bridge address.
-const MetadataPort = 8775
 
 const (
 	tokenHeader    = "X-Aws-Ec2-Metadata-Token"
@@ -38,13 +35,12 @@ const (
 	maxTokenTTL    = 6 * time.Hour
 )
 
-// metadataServer serves one host's instances.
+// metadataServer serves one host's instances, one listener per VPC.
 type metadataServer struct {
-	h      *Host
-	key    []byte
-	region string
-	srv    *http.Server
-	addr   string
+	h       *Host
+	key     []byte
+	region  string
+	servers map[string]*http.Server // by VPC
 }
 
 func newMetadataServer(h *Host) (*metadataServer, error) {
@@ -56,49 +52,78 @@ func newMetadataServer(h *Host) (*metadataServer, error) {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return &metadataServer{h: h, key: key, region: region}, nil
+	return &metadataServer{h: h, key: key, region: region, servers: map[string]*http.Server{}}, nil
 }
 
-// listen (re)starts the server on the bridge address of subnet.
-func (m *metadataServer) listen(subnet netip.Prefix) error {
-	addr := net.JoinHostPort(subnet.Addr().Next().String(), strconv.Itoa(MetadataPort))
-	if m.srv != nil && m.addr == addr {
-		return nil
+// syncMetadata listens in each VPC namespace that has none yet, and stops
+// listening in the ones gone.
+func (h *Host) syncMetadata(ctx context.Context, nets []ec2meta.VPCNet) {
+	h.mu.Lock()
+	if h.meta == nil {
+		m, err := newMetadataServer(h)
+		if err != nil {
+			h.mu.Unlock()
+			h.logf("compute: metadata service: %v", err)
+			return
+		}
+		h.meta = m
+		go func() {
+			<-ctx.Done()
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			for _, s := range m.servers {
+				s.Close()
+			}
+		}()
 	}
-	if m.srv != nil {
-		m.srv.Close()
-		m.srv = nil
+	m := h.meta
+	want := map[string]bool{}
+	var start []string
+	for _, n := range nets {
+		want[n.VPC.ID] = true
+		if m.servers[n.VPC.ID] == nil {
+			start = append(start, n.VPC.ID)
+		}
 	}
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("compute: metadata service: %w", err)
+	for vpc, s := range m.servers {
+		if !want[vpc] {
+			s.Close()
+			delete(m.servers, vpc)
+		}
 	}
-	m.srv = &http.Server{Handler: m, ReadHeaderTimeout: 5 * time.Second}
-	m.addr = addr
-	go m.srv.Serve(l)
-	return nil
-}
-
-func (m *metadataServer) close() {
-	if m.srv != nil {
-		m.srv.Close()
+	h.mu.Unlock()
+	for _, vpc := range start {
+		l, err := h.Net.Listen(vpc, net.JoinHostPort(MetadataIP, "80"))
+		if err != nil {
+			h.logf("compute: metadata service for %s: %v", vpc, err)
+			continue
+		}
+		s := &http.Server{Handler: m.handler(vpc), ReadHeaderTimeout: 5 * time.Second}
+		h.mu.Lock()
+		m.servers[vpc] = s
+		h.mu.Unlock()
+		go s.Serve(l)
 	}
 }
 
 // instance returns the instance a request comes from.
-func (m *metadataServer) instance(r *http.Request) (ec2meta.Instance, bool) {
+func (m *metadataServer) instance(vpc string, r *http.Request) (ec2meta.Instance, bool) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return ec2meta.Instance{}, false
 	}
 	m.h.mu.Lock()
 	defer m.h.mu.Unlock()
-	in, ok := m.h.byIP[host]
+	in, ok := m.h.byIP[vpc+"/"+host]
 	return in, ok
 }
 
-func (m *metadataServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	in, ok := m.instance(r)
+func (m *metadataServer) handler(vpc string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { m.serve(vpc, w, r) })
+}
+
+func (m *metadataServer) serve(vpc string, w http.ResponseWriter, r *http.Request) {
+	in, ok := m.instance(vpc, r)
 	if !ok {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
@@ -270,25 +295,4 @@ func (m *metadataServer) tree(in ec2meta.Instance) map[string]string {
 	}, "", "  ")
 	t["dynamic/instance-identity/document"] = string(doc)
 	return t
-}
-
-// startMetadata starts or moves the metadata server for the host's subnet.
-func (h *Host) startMetadata(ctx context.Context, subnet netip.Prefix) error {
-	h.mu.Lock()
-	m := h.meta
-	h.mu.Unlock()
-	if m == nil {
-		var err error
-		if m, err = newMetadataServer(h); err != nil {
-			return err
-		}
-		h.mu.Lock()
-		h.meta = m
-		h.mu.Unlock()
-		go func() {
-			<-ctx.Done()
-			m.close()
-		}()
-	}
-	return m.listen(subnet)
 }

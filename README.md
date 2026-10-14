@@ -6,8 +6,9 @@ traffic and guest RAM are encrypted; PCs contributed by strangers only ever hold
 ciphertext. Strangers' PCs get the same storage and compute features as your
 own; the only difference is encrypted guest RAM, which needs SEV-SNP or TDX.
 
-This repository has finished **M0 (mesh and cluster bootstrap)** and **M1
-(encrypted S3 storage)**, and has the core of **M2 (EC2)**: the stock
+This repository has finished **M0 (mesh and cluster bootstrap)**, **M1
+(encrypted S3 storage)** and **M3 (VPC networking)**, and has **M2 (EC2)**
+except SEV-SNP/TDX attestation: the stock
 `aws s3`, `aws s3api` and `aws ec2` commands work against it. See [docs/design.md](docs/design.md) for the
 architecture and roadmap.
 
@@ -92,7 +93,8 @@ aws ec2 create-key-pair --key-name me --key-type ed25519 \
     --query KeyMaterial --output text > me.pem
 aws ec2 run-instances --image-id ami-… --instance-type t3.small --key-name me
 aws ec2 describe-instances --query 'Reservations[].Instances[].PrivateIpAddress'
-ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
+# on the PC running it (see M3 for why):
+sudo ip netns exec jy-vpc-… ssh -i me.pem ubuntu@172.31.0.4
 ```
 
 (all with `--endpoint-url http://<gateway>:9000`)
@@ -111,9 +113,8 @@ ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
   IMDSv2 tokens): instance ID, type, addresses, placement, public keys,
   tags, user data and the identity document. Each PC serves its own
   instances, and a VM can't forge another's address to read its data.
-- cloud-init gets the key pair, user data and a static address. Each
-  compute PC hands its instances addresses from its own /24 in 10.128.0.0/9,
-  routed over the WireGuard mesh, and NATs their traffic to the internet.
+- cloud-init gets the key pair, user data and a static address in its
+  VPC subnet (see M3).
 - Placement is the `jy:placement` tag: `private` (default: your PCs),
   `any` (strangers' PCs too) or `confidential` (SEV-SNP/TDX, once
   attestation lands). A launch no PC can take fails with
@@ -129,8 +130,43 @@ ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
   Making one pauses the guest for the copy (create-image without
   `--no-reboot` shuts it down and restarts it, as EC2 does).
 - Compute PCs need `qemu-system-x86_64`, `qemu-img`, `genisoimage` (or
-  `mkisofs`/`xorriso`), `iproute2`, `iptables` and `ebtables`. `jyd -emulate` runs guests
+  `mkisofs`/`xorriso`), `iproute2` (with the `vxlan` kernel module) and
+  `iptables`. `jyd -emulate` runs guests
   without KVM, very slowly, for trying things out.
+
+## What M3 adds: VPCs and security groups
+
+```sh
+aws ec2 create-vpc --cidr-block 10.0.0.0/16
+aws ec2 create-subnet --vpc-id vpc-… --cidr-block 10.0.1.0/24
+aws ec2 create-security-group --group-name web --description web --vpc-id vpc-…
+aws ec2 authorize-security-group-ingress --group-id sg-… --protocol tcp --port 22 --cidr 10.0.0.0/16
+aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
+```
+
+- Each tenant gets a default VPC (172.31.0.0/16), default subnet
+  (172.31.0.0/20) and default security group on first use, as on EC2, so
+  plain `run-instances` works. Address ranges of different tenants may
+  overlap.
+- Supported: create/describe/delete VPCs, subnets and security groups,
+  authorize and revoke ingress and egress rules (CIDRs and group
+  references), `--subnet-id`, `--security-group-ids`/`--security-groups`
+  and `--network-interfaces` on launch, and the vpc-id, subnet-id and
+  group-id filters. Addresses are allocated from the subnet (first four and
+  last reserved).
+- Each PC keeps one network namespace per VPC it runs instances of, so
+  tenants' networks never meet. Instances in one VPC reach each other on
+  any PC through VXLAN carried inside the WireGuard mesh, and a PC accepts
+  a VPC's VXLAN traffic only from PCs running instances of it.
+- Security groups are stateful and enforced on the PC running the
+  instance, in both directions, across PCs. A guest can't use an address
+  other than its own.
+- Instances reach the internet through NAT on their PC, but not the mesh,
+  other VPCs or the PC's LAN.
+- Instances have no address outside their VPC yet. To log in, run `ssh`
+  inside the VPC's namespace on the PC that runs the instance, as above
+  (`sudo ip netns list` shows them). A tunnel through the gateway and
+  public IPs come with M5.
 
 ## Try it
 
@@ -182,7 +218,8 @@ internal/storage/     object encryption, erasure coding, placement, shard server
 internal/s3meta/      S3 metadata types (tenants, buckets, objects, uploads)
 internal/s3gw/        S3 and EC2 gateway: SigV4/SigV2, buckets, objects, multipart, EC2 Query API
 internal/ec2meta/     EC2 records (instances, key pairs, images, volumes, snapshots)
-internal/compute/     compute host: QEMU driver, volumes, snapshots, cloud-init seed, VM networking
+internal/compute/     compute host: QEMU driver, volumes, snapshots, cloud-init seed, metadata
+internal/vnet/        VPC namespaces, VXLAN, routing, NAT and security group rules on a PC
 internal/repair/      rebuilds shards lost with storage PCs
 internal/shamir/      Shamir secret sharing
 internal/cluster/     shared types: roles, trust tiers
@@ -203,12 +240,18 @@ M2:
   last snapshot is lost. Replicating them across PCs is M4 work. A volume
   on a PC that never comes back can't be deleted yet.
 - SEV-SNP/TDX attestation, so `confidential` placement has no hosts yet.
-- Security groups and isolation between instances on one PC (M3); today
-  every instance can reach every other instance on the mesh.
 - Instances on a PC that dies are not restarted elsewhere (M4).
-- Public IPs (M5); instances are reached from PCs on the mesh.
+- Public IPs and a way in from outside the VPC (M5).
 - Spot, launch templates, IAM instance profiles (the metadata service has
   no credentials to hand out yet).
+
+M3:
+
+- Route tables, internet gateways, network ACLs, VPC peering and extra
+  network interfaces answer `InvalidAction`. Every subnet routes to the
+  internet through its PC's NAT.
+- IPv6.
+- Internet NAT is untested here (the test machine had no internet).
 
 M1:
 

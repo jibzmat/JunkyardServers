@@ -68,7 +68,7 @@ func TestRunInstancesSchedulesAndHostReports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Subnet != "10.128.0.0/24" || len(v.Instances) != 2 {
+	if len(v.Networks) != 1 || len(v.Networks[0].Endpoints) != 2 || v.Networks[0].VPC.CIDR != ec2meta.DefaultVPCCIDR || len(v.Instances) != 2 {
 		t.Fatalf("host view %+v", v)
 	}
 	ips := map[string]bool{}
@@ -78,7 +78,8 @@ func TestRunInstancesSchedulesAndHostReports(t *testing.T) {
 		}
 		ips[in.PrivateIP] = true
 	}
-	if !ips["10.128.0.10"] || !ips["10.128.0.11"] {
+	// The default subnet's first four addresses are reserved.
+	if !ips["172.31.0.4"] || !ips["172.31.0.5"] {
 		t.Fatalf("ips %v", ips)
 	}
 	id := v.Instances[0].ID

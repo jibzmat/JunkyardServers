@@ -17,29 +17,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jibzmat/JunkyardServers/internal/cluster"
+	"github.com/jibzmat/JunkyardServers/internal/vnet"
 )
 
 // QEMU runs instances as QEMU processes with KVM, or under QEMU's emulator
 // when the PC has no KVM (slow; for trying things out). Each VM is a
-// daemonised process that outlives jyd restarts, with a tap on the host's
-// bridge, a qcow2 disk backed by the cached image and a cloud-init seed.
+// daemonised process that outlives jyd restarts, in its VPC's network
+// namespace with a routed tap, a qcow2 disk backed by the cached image and
+// a cloud-init seed.
 type QEMU struct {
-	// Bridge is the host bridge instances attach to.
-	Bridge string
 	// Emulate runs guests under TCG instead of KVM.
 	Emulate bool
 	// Binary is the QEMU system emulator; default qemu-system-x86_64.
 	Binary string
-}
-
-const defaultBridge = "jybr0"
-
-func (q *QEMU) bridge() string {
-	if q.Bridge == "" {
-		return defaultBridge
-	}
-	return q.Bridge
 }
 
 func (q *QEMU) binary() string {
@@ -52,7 +42,7 @@ func (q *QEMU) binary() string {
 // Check reports what's missing to run instances.
 func (q *QEMU) Check() error {
 	var missing []string
-	for _, b := range []string{q.binary(), "qemu-img", "ip", "iptables", "ebtables"} {
+	for _, b := range []string{q.binary(), "qemu-img", "ip"} {
 		if _, err := exec.LookPath(b); err != nil {
 			missing = append(missing, b)
 		}
@@ -79,69 +69,6 @@ func run(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-// Network sets up the bridge for subnet, with the host as .1, forwarding,
-// and NAT for traffic leaving the cluster. Traffic to the mesh and to
-// other hosts' instances is routed, not NATed. It is idempotent.
-func (q *QEMU) Network(ctx context.Context, subnet netip.Prefix) error {
-	br := q.bridge()
-	gw := netip.PrefixFrom(subnet.Addr().Next(), subnet.Bits())
-	if _, err := net.InterfaceByName(br); err != nil {
-		if err := run(ctx, "ip", "link", "add", br, "type", "bridge"); err != nil {
-			return err
-		}
-	}
-	if err := run(ctx, "ip", "addr", "replace", gw.String(), "dev", br); err != nil {
-		return err
-	}
-	if err := run(ctx, "ip", "link", "set", br, "up"); err != nil {
-		return err
-	}
-	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644); err != nil {
-		return fmt.Errorf("compute: enabling forwarding: %w", err)
-	}
-	// Our own chains, rebuilt each time, hooked in once.
-	rules := []struct {
-		table, chain, hook string
-		rules              [][]string
-	}{
-		{"nat", "JY-NAT", "POSTROUTING", [][]string{
-			{"-d", subnet.String(), "-j", "RETURN"},
-			{"-d", "100.64.0.0/10", "-j", "RETURN"},
-			{"-d", cluster.VMCIDR, "-j", "RETURN"},
-			{"-s", subnet.String(), "-j", "MASQUERADE"},
-		}},
-		{"filter", "JY-FORWARD", "FORWARD", [][]string{
-			{"-i", br, "-j", "ACCEPT"},
-			{"-o", br, "-j", "ACCEPT"},
-		}},
-		// The metadata service, as guests address it.
-		{"nat", "JY-PRE", "PREROUTING", [][]string{
-			{"-i", br, "-d", MetadataIP + "/32", "-p", "tcp", "--dport", "80",
-				"-j", "DNAT", "--to-destination", net.JoinHostPort(gw.Addr().String(), strconv.Itoa(MetadataPort))},
-		}},
-		{"filter", "JY-INPUT", "INPUT", [][]string{
-			{"-i", br, "-p", "tcp", "--dport", strconv.Itoa(MetadataPort), "-j", "ACCEPT"},
-		}},
-	}
-	for _, r := range rules {
-		_ = run(ctx, "iptables", "-t", r.table, "-N", r.chain) // exists already is fine
-		if err := run(ctx, "iptables", "-t", r.table, "-F", r.chain); err != nil {
-			return err
-		}
-		for _, rule := range r.rules {
-			if err := run(ctx, "iptables", append([]string{"-t", r.table, "-A", r.chain}, rule...)...); err != nil {
-				return err
-			}
-		}
-		if run(ctx, "iptables", "-t", r.table, "-C", r.hook, "-j", r.chain) != nil {
-			if err := run(ctx, "iptables", "-t", r.table, "-I", r.hook, "-j", r.chain); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // ConvertImage turns a downloaded image into the qcow2 instances' disks
 // are backed by.
 func (q *QEMU) ConvertImage(ctx context.Context, src, format, dst string) error {
@@ -149,15 +76,6 @@ func (q *QEMU) ConvertImage(ctx context.Context, src, format, dst string) error 
 		return fmt.Errorf("compute: unsupported image format %q", format)
 	}
 	return run(ctx, "qemu-img", "convert", "-f", format, "-O", "qcow2", src, dst)
-}
-
-// tap is the tap device name for an instance (at most 15 characters).
-func tap(id string) string {
-	id = strings.TrimPrefix(id, "i-")
-	if len(id) > 13 {
-		id = id[:13]
-	}
-	return "jy" + id
 }
 
 // Prepare creates an instance's disk (a qcow2 overlay on image, grown to
@@ -230,19 +148,18 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 	if q.Running(vm) {
 		return nil
 	}
-	t := tap(vm.Instance.ID)
-	if _, err := net.InterfaceByName(t); err != nil {
-		if err := run(ctx, "ip", "tuntap", "add", "dev", t, "mode", "tap"); err != nil {
+	// The tap is made in the VPC's namespace, and QEMU runs there to open
+	// it; the host then routes it (vnet.Manager.Plug).
+	t := vnet.TapName(vm.Instance.ID)
+	if run(ctx, "ip", "-n", vm.NetNS, "link", "show", t) != nil {
+		if err := run(ctx, "ip", "-n", vm.NetNS, "tuntap", "add", "dev", t, "mode", "tap"); err != nil {
 			return err
 		}
 	}
-	if err := run(ctx, "ip", "link", "set", t, "master", q.bridge(), "up"); err != nil {
+	if err := os.WriteFile(filepath.Join(vm.Dir, "netns"), []byte(vm.NetNS+"\n"), 0o600); err != nil {
 		return err
 	}
 	in := vm.Instance
-	if err := antiSpoof(ctx, t, in.PrivateIP, in.MAC); err != nil {
-		return err
-	}
 	accel, cpu := "kvm", "host"
 	if q.Emulate {
 		accel, cpu = "tcg,thread=multi", "max"
@@ -276,7 +193,7 @@ func (q *QEMU) Start(ctx context.Context, vm *VM) error {
 			"-blockdev", "driver=qcow2,node-name="+nodeName(d.ID)+",file.driver=file,file.filename="+d.Path,
 			"-device", volumeDevice(d.ID)+",bus="+fmt.Sprintf("rp%d", i+1)+",addr=0")
 	}
-	return run(ctx, q.binary(), args...)
+	return run(ctx, "ip", append([]string{"netns", "exec", vm.NetNS, q.binary()}, args...)...)
 }
 
 // rootPorts is the number of hotplug slots, so the most volumes an
@@ -480,50 +397,15 @@ func (q *QEMU) Destroy(ctx context.Context, vm *VM) error {
 	if err := q.Stop(ctx, vm, false); err != nil {
 		return err
 	}
-	removeAntiSpoof(ctx, tap(vm.Instance.ID))
-	if _, err := net.InterfaceByName(tap(vm.Instance.ID)); err == nil {
-		return run(ctx, "ip", "link", "del", tap(vm.Instance.ID))
+	ns := vm.NetNS
+	if b, err := os.ReadFile(filepath.Join(vm.Dir, "netns")); err == nil {
+		ns = strings.TrimSpace(string(b)) // where it was started
+	}
+	t := vnet.TapName(vm.Instance.ID)
+	if ns != "" && run(ctx, "ip", "-n", ns, "link", "show", t) == nil {
+		return run(ctx, "ip", "-n", ns, "link", "del", t)
 	}
 	return nil
-}
-
-// antiSpoof stops a VM sending frames with any address but its own, so it
-// can't pass itself off as another instance (the metadata service and
-// other instances trust source addresses). Each tap gets an ebtables
-// chain, rebuilt on every start.
-func antiSpoof(ctx context.Context, tap, ip, mac string) error {
-	chain := "JY-" + tap
-	_ = run(ctx, "ebtables", "-N", chain, "-P", "RETURN")
-	if err := run(ctx, "ebtables", "-F", chain); err != nil {
-		return err
-	}
-	for _, rule := range [][]string{
-		{"-s", "!", mac, "-j", "DROP"},
-		{"-p", "ARP", "--arp-mac-src", "!", mac, "-j", "DROP"},
-		{"-p", "ARP", "--arp-ip-src", "!", ip, "-j", "DROP"},
-		{"-p", "IPv4", "--ip-src", "!", ip, "-j", "DROP"},
-	} {
-		if err := run(ctx, "ebtables", append([]string{"-A", chain}, rule...)...); err != nil {
-			return err
-		}
-	}
-	for _, hook := range []string{"INPUT", "FORWARD"} {
-		for run(ctx, "ebtables", "-D", hook, "-i", tap, "-j", chain) == nil {
-		}
-		if err := run(ctx, "ebtables", "-A", hook, "-i", tap, "-j", chain); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func removeAntiSpoof(ctx context.Context, tap string) {
-	chain := "JY-" + tap
-	for _, hook := range []string{"INPUT", "FORWARD"} {
-		for run(ctx, "ebtables", "-D", hook, "-i", tap, "-j", chain) == nil {
-		}
-	}
-	_ = run(ctx, "ebtables", "-X", chain)
 }
 
 // qmp sends one command without arguments over the instance's QMP socket.

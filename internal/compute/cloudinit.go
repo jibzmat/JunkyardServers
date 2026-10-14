@@ -40,8 +40,9 @@ func userData(in ec2meta.Instance) string {
 	return b.String()
 }
 
-// networkConfig gives the instance its address statically: the host's
-// bridge (.1 of the subnet) is the gateway.
+// networkConfig gives the instance its address statically. The gateway
+// is .1 of its subnet, which the PC answers for (proxy ARP); the MTU leaves
+// room for VXLAN inside WireGuard.
 func networkConfig(in ec2meta.Instance, gateway string, bits int) string {
 	var dns []string
 	for _, d := range DNS {
@@ -53,11 +54,12 @@ ethernets:
     match:
       macaddress: "%s"
     set-name: eth0
+    mtu: %d
     addresses: [%s/%d]
     routes:
       - to: default
         via: %s
     nameservers:
       addresses: [%s]
-`, in.MAC, in.PrivateIP, bits, gateway, strings.Join(dns, ", "))
+`, in.MAC, ec2meta.GuestMTU, in.PrivateIP, bits, gateway, strings.Join(dns, ", "))
 }

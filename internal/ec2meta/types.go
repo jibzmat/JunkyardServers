@@ -120,10 +120,15 @@ type Instance struct {
 	StateReason string    `json:"state_reason,omitempty"`
 	Changed     time.Time `json:"changed"` // when State last changed
 
-	// Set by the scheduler.
-	Host      string `json:"host,omitempty"` // node ID
-	PrivateIP string `json:"private_ip,omitempty"`
-	MAC       string `json:"mac,omitempty"`
+	// Networking, fixed at launch.
+	VpcID          string   `json:"vpc_id,omitempty"`
+	SubnetID       string   `json:"subnet_id,omitempty"`
+	SecurityGroups []string `json:"security_groups,omitempty"`
+	PrivateIP      string   `json:"private_ip,omitempty"`
+	MAC            string   `json:"mac,omitempty"`
+
+	// Host is the PC running it, set by the scheduler.
+	Host string `json:"host,omitempty"` // node ID
 
 	// RebootSeq is bumped by RebootInstances; the host reboots the VM when
 	// it sees a value it hasn't acted on.
@@ -293,14 +298,12 @@ type ConsoleOutput struct {
 // MaxConsole is how much console output is kept, as on EC2.
 const MaxConsole = 64 << 10
 
-// HostSubnetBits is the size of the subnet each compute host's instances
-// get addresses from.
-const HostSubnetBits = 24
-
 // HostView is what a compute host fetches: its subnet, instances,
 // volumes and tasks.
 type HostView struct {
-	Subnet    string     `json:"subnet"` // e.g. 10.128.3.0/24; empty until first scheduled
+	Node      string     `json:"node"`               // the host's own node ID
+	MeshIP    string     `json:"mesh_ip"`            // and mesh address, the VXLAN underlay
+	Networks  []VPCNet   `json:"networks,omitempty"` // the VPCs of the host's instances
 	Instances []Instance `json:"instances"`
 	Volumes   []Volume   `json:"volumes,omitempty"`
 	Tasks     []Task     `json:"tasks,omitempty"`

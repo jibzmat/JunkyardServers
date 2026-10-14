@@ -150,6 +150,11 @@ func (f *fakeControl) last() ec2meta.StatusReport {
 	return f.reports[len(f.reports)-1]
 }
 
+var testNets = []ec2meta.VPCNet{{
+	VPC:     ec2meta.VPC{ID: "vpc-1", CIDR: "10.128.0.0/16"},
+	Subnets: []ec2meta.Subnet{{ID: "subnet-1", VpcID: "vpc-1", CIDR: "10.128.0.0/24"}},
+}}
+
 type fakeDriver struct {
 	mu      sync.Mutex
 	running map[string]bool
@@ -209,13 +214,6 @@ func (d *fakeDriver) Capture(_ context.Context, vm *VM, src, dst string) error {
 		return err
 	}
 	return os.WriteFile(dst, append([]byte("copy of "), b...), 0o600)
-}
-
-func (d *fakeDriver) Network(_ context.Context, p netip.Prefix) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.network = p.String()
-	return nil
 }
 
 func (d *fakeDriver) ConvertImage(_ context.Context, src, format, dst string) error {
@@ -286,8 +284,8 @@ func (d *fakeDriver) Reboot(*VM) error {
 func (d *fakeDriver) Destroy(ctx context.Context, vm *VM) error { return d.Stop(ctx, vm, false) }
 
 func TestHostLifecycle(t *testing.T) {
-	ctl := &fakeControl{view: ec2meta.HostView{Subnet: "10.128.0.0/24", Instances: []ec2meta.Instance{{
-		ID: "i-0123456789abcdef0", ImageID: "ami-1", State: ec2meta.StatePending, PrivateIP: "10.128.0.10",
+	ctl := &fakeControl{view: ec2meta.HostView{Networks: testNets, Instances: []ec2meta.Instance{{
+		ID: "i-0123456789abcdef0", ImageID: "ami-1", State: ec2meta.StatePending, PrivateIP: "10.128.0.10", VpcID: "vpc-1", SubnetID: "subnet-1",
 		MAC: "02:00:00:00:00:01", PublicKey: "ssh-ed25519 AAAA k", VCPU: 2, MemMiB: 1024, RootGiB: 8,
 	}}}}
 	drv := &fakeDriver{}
@@ -303,8 +301,8 @@ func TestHostLifecycle(t *testing.T) {
 	id := "i-0123456789abcdef0"
 
 	step()
-	if drv.network != "10.128.0.0/24" || !drv.running[id] || ctl.last().State != ec2meta.StateRunning {
-		t.Fatalf("not started: net %q running %v reports %+v", drv.network, drv.running, ctl.reports)
+	if !drv.running[id] || ctl.last().State != ec2meta.StateRunning {
+		t.Fatalf("not started: running %v reports %+v", drv.running, ctl.reports)
 	}
 	seed := drv.seeds[id]
 	for _, want := range []string{"instance-id: " + id, "ssh-ed25519 AAAA k", "10.128.0.10/24", "via: 10.128.0.1", "02:00:00:00:00:01"} {
@@ -382,9 +380,9 @@ func TestUnassignedVMsAreDestroyed(t *testing.T) {
 
 func TestVolumesAndTasks(t *testing.T) {
 	id := "i-0123456789abcdef0"
-	ctl := &fakeControl{view: ec2meta.HostView{Subnet: "10.128.0.0/24",
+	ctl := &fakeControl{view: ec2meta.HostView{Networks: testNets,
 		Instances: []ec2meta.Instance{{
-			ID: id, ImageID: "ami-1", State: ec2meta.StatePending, PrivateIP: "10.128.0.10",
+			ID: id, ImageID: "ami-1", State: ec2meta.StatePending, PrivateIP: "10.128.0.10", VpcID: "vpc-1", SubnetID: "subnet-1",
 			MAC: "02:00:00:00:00:01", VCPU: 1, MemMiB: 512, RootGiB: 8,
 		}},
 		// One volume attached before the first boot, restored from a snapshot.
@@ -498,7 +496,8 @@ func TestMetadataService(t *testing.T) {
 	in := ec2meta.Instance{ID: "i-0123456789abcdef0", Tenant: "alice", ImageID: "ami-1", Type: "t3.small",
 		PrivateIP: "10.128.0.10", MAC: "02:00:00:00:00:01", KeyName: "me", PublicKey: "ssh-ed25519 AAAA me",
 		UserData: []byte("#!/bin/sh\necho hi\n"), ReservationID: "r-1"}
-	h.byIP = map[string]ec2meta.Instance{in.PrivateIP: in}
+	in.VpcID = "vpc-1"
+	h.byIP = map[string]ec2meta.Instance{"vpc-1/" + in.PrivateIP: in}
 
 	do := func(method, path, from string, hdr map[string]string) (int, string) {
 		t.Helper()
@@ -508,7 +507,7 @@ func TestMetadataService(t *testing.T) {
 			r.Header.Set(k, v)
 		}
 		w := httptest.NewRecorder()
-		m.ServeHTTP(w, r)
+		m.handler("vpc-1").ServeHTTP(w, r)
 		return w.Code, w.Body.String()
 	}
 	me := in.PrivateIP
@@ -555,7 +554,7 @@ func TestMetadataService(t *testing.T) {
 	}
 	other := in
 	other.ID, other.PrivateIP = "i-other", "10.128.0.11"
-	h.byIP[other.PrivateIP] = other
+	h.byIP["vpc-1/"+other.PrivateIP] = other
 	if code, _ := do("GET", "/latest/meta-data/instance-id", other.PrivateIP, map[string]string{tokenHeader: tok}); code != 401 {
 		t.Errorf("another instance's token got %d", code)
 	}

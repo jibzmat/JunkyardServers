@@ -52,6 +52,17 @@ type EC2Meta interface {
 	Snapshots(ctx context.Context, tenant string, ids []string) ([]ec2meta.Snapshot, error)
 	CreateImage(ctx context.Context, req ec2meta.CreateImageRequest) (*ec2meta.Image, error)
 	Console(ctx context.Context, tenant, id string) (*ec2meta.ConsoleOutput, error)
+
+	CreateVPC(ctx context.Context, req ec2meta.VPCRequest) (*ec2meta.VPC, error)
+	DeleteVPC(ctx context.Context, tenant, id string) error
+	VPCs(ctx context.Context, req ec2meta.VPCRequest) ([]ec2meta.VPC, error)
+	CreateSubnet(ctx context.Context, req ec2meta.SubnetRequest) (*ec2meta.Subnet, error)
+	DeleteSubnet(ctx context.Context, tenant, id string) error
+	Subnets(ctx context.Context, req ec2meta.SubnetRequest) ([]ec2meta.Subnet, error)
+	CreateGroup(ctx context.Context, req ec2meta.GroupRequest) (*ec2meta.SecurityGroup, error)
+	DeleteGroup(ctx context.Context, tenant, id string) error
+	Groups(ctx context.Context, req ec2meta.GroupRequest) ([]ec2meta.SecurityGroup, error)
+	GroupRules(ctx context.Context, req ec2meta.RulesRequest) (*ec2meta.SecurityGroup, error)
 }
 
 const ec2NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
@@ -235,6 +246,38 @@ func (g *Gateway) serveEC2(q *request) error {
 			XMLName xml.Name `xml:"x"`
 			ID      string   `xml:"imageId"`
 		}{ID: img.ID})
+	case "CreateVpc":
+		return g.createVpc(q, p)
+	case "DescribeVpcs":
+		return g.describeVpcs(q, p)
+	case "DeleteVpc":
+		if err := g.EC2.DeleteVPC(q.ctx, q.tenant, p.Get("VpcId")); err != nil {
+			return err
+		}
+		return g.ec2Return(q, "DeleteVpcResponse")
+	case "CreateSubnet":
+		return g.createSubnet(q, p)
+	case "DescribeSubnets":
+		return g.describeSubnets(q, p)
+	case "DeleteSubnet":
+		if err := g.EC2.DeleteSubnet(q.ctx, q.tenant, p.Get("SubnetId")); err != nil {
+			return err
+		}
+		return g.ec2Return(q, "DeleteSubnetResponse")
+	case "CreateSecurityGroup":
+		return g.createSecurityGroup(q, p)
+	case "DescribeSecurityGroups":
+		return g.describeSecurityGroups(q, p)
+	case "DeleteSecurityGroup":
+		return g.deleteSecurityGroup(q, p)
+	case "AuthorizeSecurityGroupIngress":
+		return g.groupRules(q, p, false, false, "AuthorizeSecurityGroupIngressResponse")
+	case "AuthorizeSecurityGroupEgress":
+		return g.groupRules(q, p, true, false, "AuthorizeSecurityGroupEgressResponse")
+	case "RevokeSecurityGroupIngress":
+		return g.groupRules(q, p, false, true, "RevokeSecurityGroupIngressResponse")
+	case "RevokeSecurityGroupEgress":
+		return g.groupRules(q, p, true, true, "RevokeSecurityGroupEgressResponse")
 	case "GetConsoleOutput":
 		c, err := g.EC2.Console(q.ctx, q.tenant, p.Get("InstanceId"))
 		if err != nil {
@@ -344,6 +387,10 @@ type instanceXML struct {
 		State string `xml:"state"`
 	} `xml:"monitoring"`
 	PrivateIP          string           `xml:"privateIpAddress,omitempty"`
+	SubnetID           string           `xml:"subnetId,omitempty"`
+	VpcID              string           `xml:"vpcId,omitempty"`
+	Groups             []groupRefXML    `xml:"groupSet>item"`
+	SourceDestCheck    bool             `xml:"sourceDestCheck"`
 	Architecture       string           `xml:"architecture"`
 	RootDeviceType     string           `xml:"rootDeviceType"`
 	RootDeviceName     string           `xml:"rootDeviceName"`
@@ -357,6 +404,11 @@ type instanceXML struct {
 		CoreCount      int `xml:"coreCount"`
 		ThreadsPerCore int `xml:"threadsPerCore"`
 	} `xml:"cpuOptions"`
+}
+
+type groupRefXML struct {
+	ID   string `xml:"groupId"`
+	Name string `xml:"groupName"`
 }
 
 type blockDeviceXML struct {
@@ -380,6 +432,10 @@ func (g *Gateway) instanceXML(in ec2meta.Instance) instanceXML {
 		KeyName: in.KeyName, LaunchIndex: in.LaunchIndex, InstanceType: in.Type, LaunchTime: iso(in.Launched),
 		PrivateIP: in.PrivateIP, Architecture: "x86_64", RootDeviceType: "instance-store", RootDeviceName: "/dev/vda",
 		VirtualizationType: "hvm", Hypervisor: "kvm", ClientToken: in.ClientToken, Tags: tagSet(in.Tags),
+		SubnetID: in.SubnetID, VpcID: in.VpcID, SourceDestCheck: true,
+	}
+	for _, id := range in.SecurityGroups {
+		x.Groups = append(x.Groups, groupRefXML{ID: id})
 	}
 	x.Placement.AvailabilityZone, x.Placement.Tenancy = g.zone(), "default"
 	x.Monitoring.State = "disabled"
@@ -494,6 +550,23 @@ func (g *Gateway) runInstances(q *request, p ec2Params) error {
 	if len(t.Tags) == 0 {
 		t.Tags = nil
 	}
+	t.SubnetID = p.Get("SubnetId")
+	t.SecurityGroups = p.list("SecurityGroupId")
+	if ni := "NetworkInterface.1."; p.Get(ni+"SubnetId") != "" || p.Get(ni+"SecurityGroupId.1") != "" {
+		if t.SubnetID == "" {
+			t.SubnetID = p.Get(ni + "SubnetId")
+		}
+		t.SecurityGroups = append(t.SecurityGroups, p.list(ni+"SecurityGroupId")...)
+	}
+	if names := p.list("SecurityGroup"); len(names) > 0 {
+		gs, err := g.EC2.Groups(q.ctx, ec2meta.GroupRequest{Tenant: q.tenant, Names: names})
+		if err != nil {
+			return err
+		}
+		for _, sg := range gs {
+			t.SecurityGroups = append(t.SecurityGroups, sg.ID)
+		}
+	}
 	// We launch MaxCount if possible; the control plane rejects a launch
 	// no host can take, so MinCount is met or nothing is launched.
 	resp, err := g.EC2.RunInstances(q.ctx, q.tenant, ec2meta.RunRequest{Template: t, Count: maxC})
@@ -534,6 +607,12 @@ func matchInstance(in ec2meta.Instance, filters map[string][]string) bool {
 			got = []string{in.PrivateIP}
 		case name == "reservation-id":
 			got = []string{in.ReservationID}
+		case name == "vpc-id":
+			got = []string{in.VpcID}
+		case name == "subnet-id":
+			got = []string{in.SubnetID}
+		case name == "instance.group-id", name == "group-id":
+			got = in.SecurityGroups
 		case name == "tag-key":
 			for k := range in.Tags {
 				got = append(got, k)
@@ -597,6 +676,14 @@ func (g *Gateway) describeInstances(q *request, p ec2Params) error {
 	if err != nil {
 		return err
 	}
+	groups, err := g.EC2.Groups(q.ctx, ec2meta.GroupRequest{Tenant: q.tenant})
+	if err != nil {
+		return err
+	}
+	groupName := map[string]string{}
+	for _, sg := range groups {
+		groupName[sg.ID] = sg.Name
+	}
 	type reservation struct {
 		ID        string        `xml:"reservationId"`
 		OwnerID   string        `xml:"ownerId"`
@@ -616,6 +703,9 @@ func (g *Gateway) describeInstances(q *request, p ec2Params) error {
 			out = append(out, reservation{ID: in.ReservationID, OwnerID: ownerID(q.tenant)})
 		}
 		x := g.instanceXML(in)
+		for j := range x.Groups {
+			x.Groups[j].Name = groupName[x.Groups[j].ID]
+		}
 		for _, v := range vols {
 			if v.Instance == in.ID {
 				var m blockDeviceXML

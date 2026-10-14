@@ -333,3 +333,55 @@ func (c *Client) SendConsole(ctx context.Context, out ec2meta.ConsoleOutput) err
 	var resp struct{}
 	return c.call(ctx, http.MethodPost, "/v1/ec2/host/console", out, &resp)
 }
+
+// VPCs, subnets and security groups.
+
+func (c *Client) CreateVPC(ctx context.Context, req ec2meta.VPCRequest) (*ec2meta.VPC, error) {
+	var out ec2meta.VPC
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/vpcs/create", req, &out)
+}
+
+func (c *Client) DeleteVPC(ctx context.Context, tenant, id string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/vpcs/delete", ec2meta.VPCRequest{Tenant: tenant, IDs: []string{id}}, &out)
+}
+
+func (c *Client) VPCs(ctx context.Context, req ec2meta.VPCRequest) ([]ec2meta.VPC, error) {
+	var out []ec2meta.VPC
+	return out, c.call(ctx, http.MethodPost, "/v1/ec2/vpcs/list", req, &out)
+}
+
+func (c *Client) CreateSubnet(ctx context.Context, req ec2meta.SubnetRequest) (*ec2meta.Subnet, error) {
+	var out ec2meta.Subnet
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/subnets/create", req, &out)
+}
+
+func (c *Client) DeleteSubnet(ctx context.Context, tenant, id string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/subnets/delete", ec2meta.SubnetRequest{Tenant: tenant, IDs: []string{id}}, &out)
+}
+
+func (c *Client) Subnets(ctx context.Context, req ec2meta.SubnetRequest) ([]ec2meta.Subnet, error) {
+	var out []ec2meta.Subnet
+	return out, c.call(ctx, http.MethodPost, "/v1/ec2/subnets/list", req, &out)
+}
+
+func (c *Client) CreateGroup(ctx context.Context, req ec2meta.GroupRequest) (*ec2meta.SecurityGroup, error) {
+	var out ec2meta.SecurityGroup
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/groups/create", req, &out)
+}
+
+func (c *Client) DeleteGroup(ctx context.Context, tenant, id string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/groups/delete", ec2meta.GroupRequest{Tenant: tenant, IDs: []string{id}}, &out)
+}
+
+func (c *Client) Groups(ctx context.Context, req ec2meta.GroupRequest) ([]ec2meta.SecurityGroup, error) {
+	var out []ec2meta.SecurityGroup
+	return out, c.call(ctx, http.MethodPost, "/v1/ec2/groups/list", req, &out)
+}
+
+func (c *Client) GroupRules(ctx context.Context, req ec2meta.RulesRequest) (*ec2meta.SecurityGroup, error) {
+	var out ec2meta.SecurityGroup
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/groups/rules", req, &out)
+}

@@ -422,6 +422,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/controls/{id}", s.requireKind(s.leaderOnly(s.handleControlRemove), pki.KindAdmin))
 	s.s3Routes(mux)
 	s.ec2Routes(mux)
+	s.vpcRoutes(mux)
 	s.ec2StorageRoutes(mux)
 	s.keyRoutes(mux)
 	return mux

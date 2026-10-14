@@ -102,9 +102,7 @@ the control plane registry.
   cloud-init NoCloud seed (key pair, user data, static network config),
   and report state changes; the control plane accepts only transitions a
   host may make.
-- Networking: each compute host gets a /24 of 10.128.0.0/9 on first use,
-  served on a bridge (host = .1), routed to it over WireGuard (the subnet is
-  in the peer's AllowedIPs) and NATed for traffic leaving the cluster.
+- Networking: see M3 below.
 - Volumes: a qcow2 file on one compute host, chosen when the volume is
   first attached (the instance's host); attachments are attaching →
   attached → detaching, moved along by host reports. Hosts give each VM 8
@@ -118,14 +116,62 @@ the control plane registry.
   bucket and completes the task. Tasks on a host gone for 2 minutes fail.
 - Console output: hosts send the last 64 KiB of each VM's serial log when it
   changes (and every 5 minutes); the leader keeps it in memory only.
-- Metadata service: each host answers 169.254.169.254 (DNATed to its bridge
-  address) from its own copy of its instances, identifying the caller by
-  source address. Per-tap ebtables rules drop frames whose MAC, ARP or
-  IPv4 source isn't the instance's, so the address can be trusted.
+- Metadata service: each host answers 169.254.169.254 for its own
+  instances (see M3), identifying the caller by VPC and source address.
   IMDSv2 tokens are HMACs bound to the instance and its address.
 - A host destroys VMs it no longer sees only after a minute, and the control
   plane serves host views only once a leader has applied the whole log, so
   a restart can't make a host wipe its VMs.
+
+## Networking (M3)
+
+Goal: EC2's VPC model. Tenants pick their own address ranges (they may
+overlap between tenants), instances in one VPC reach each other on any PC,
+nothing else reaches them unless a security group allows it, and
+instances reach the internet through NAT.
+
+- Records (Raft state): VPC (CIDR /16 to /28, a 24-bit VNI), subnet (CIDR
+  inside its VPC), security group (in one VPC, ingress and egress rules
+  whose source is a CIDR or another group). Each tenant gets a default VPC
+  172.31.0.0/16 with a default subnet 172.31.0.0/20 and a default group,
+  made on first use, as on EC2.
+- IPAM: an instance's address comes from its subnet, chosen by the leader
+  at launch (the first four addresses and the last are reserved, as on
+  EC2: network, router, DNS, future, broadcast). The MAC is derived from
+  the instance ID.
+- On each PC, one network namespace per VPC that has instances there. It
+  holds the VPC's routing table and firewall, so overlapping CIDRs of
+  different tenants never meet, and conntrack is per VPC.
+  - Instances are routed, not bridged: each tap is a point-to-point link
+    with proxy ARP and a /32 route to its instance. Each subnet's router
+    address (.1) is on the namespace's loopback, so the PC answers the
+    guest's ARP for its gateway. Guests' MTU is 1370 (WireGuard
+    and VXLAN headers).
+  - Between PCs: a VXLAN device per VPC namespace (VNI = the VPC's), whose
+    underlay is the WireGuard mesh, so traffic is encrypted between PCs. A
+    remote instance is a /32 route via its PC's mesh address, with static
+    neighbour and FDB entries; nothing is learned or flooded.
+  - The PC accepts VXLAN only from PCs that run instances of that VPC (an
+    iptables u32 match on outer source and VNI), so a PC can't inject
+    traffic into a VPC it has no part in.
+  - Internet: a veth pair from the namespace to the PC's own namespace,
+    with NAT on both sides. Forwarding from the veth to the mesh, to other
+    VPCs' veths or to private ranges on the PC's LAN is dropped.
+  - Metadata: 169.254.169.254 is on the namespace's loopback, served by
+    jyd through a socket opened inside the namespace, so the caller is
+    known by (VPC, source address).
+- Security groups: stateful (conntrack), enforced in the namespace's
+  FORWARD chain on the PC that runs the instance, for both directions:
+  established traffic is accepted, then an instance's egress rules on
+  packets from its tap, its ingress rules on packets to its tap, and the
+  rest dropped. A rule naming a group expands to the member instances' addresses,
+  refreshed from the control plane (the whole ruleset is swapped with one
+  iptables-restore). A host also drops packets from a tap
+  whose source isn't the instance's (strict reverse-path filtering).
+- The M2 scheme (one routed /24 of 10.128.0.0/9 per PC, all instances in
+  one network) is removed. Instances are no longer reachable from the
+  mesh; reaching them from outside the VPC (an Instance Connect Endpoint
+  style tunnel, public IPs) comes with M5.
 
 ## Roadmap
 

@@ -423,7 +423,6 @@ func ApplyRoutes(peers []mesh.Peer, routes []nat.Route) []mesh.Peer {
 		if i, ok := byID[r.Via]; ok {
 			p := byNode[r.NodeID]
 			out[i].Relayed = append(out[i].Relayed, p.MeshIP)
-			out[i].Relayed = append(out[i].Relayed, p.Subnets...)
 		}
 	}
 	return out
@@ -463,11 +462,7 @@ func Peers(registry []cluster.Member, alive []membership.Meta, self string) []me
 		if live, ok := endpoints[m.NodeID]; ok {
 			ep = live
 		}
-		p := mesh.Peer{NodeID: m.NodeID, PublicKey: m.WGPublic, Endpoint: ep, MeshIP: m.MeshIP}
-		if m.VMSubnet != "" {
-			p.Subnets = []string{m.VMSubnet}
-		}
-		out = append(out, p)
+		out = append(out, mesh.Peer{NodeID: m.NodeID, PublicKey: m.WGPublic, Endpoint: ep, MeshIP: m.MeshIP})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out

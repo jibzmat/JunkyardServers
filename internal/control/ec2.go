@@ -3,12 +3,10 @@ package control
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -31,9 +29,6 @@ const (
 	imageBucket = "_images"
 	systemOwner = "_system"
 )
-
-// vmNetwork is carved into one /24 per compute host for its instances.
-var vmNetwork = netip.MustParsePrefix(cluster.VMCIDR)
 
 // How long finished things linger, and how long a host may be silent.
 const (
@@ -74,18 +69,22 @@ type ec2Command struct {
 	Image     *ec2meta.Image         `json:"image,omitempty"`
 	Object    *s3meta.Object         `json:"object,omitempty"`
 	Tags      *ec2meta.TagsRequest   `json:"tags,omitempty"`
+	Net       *vpcCommand            `json:"net,omitempty"`
 }
 
 // ec2State is the EC2 part of the replicated state.
 type ec2State struct {
-	Instances map[string]*ec2meta.Instance `json:"instances"`
-	KeyPairs  map[string]*ec2meta.KeyPair  `json:"key_pairs"` // tenant + "/" + name
-	Images    map[string]*ec2meta.Image    `json:"images"`
-	Volumes   map[string]*ec2meta.Volume   `json:"volumes"`
-	Snapshots map[string]*ec2meta.Snapshot `json:"snapshots"`
-	Tasks     map[string]*ec2meta.Task     `json:"tasks"`
-	// NextSubnet is the index of the next host subnet to hand out.
-	NextSubnet int `json:"next_subnet"`
+	Instances map[string]*ec2meta.Instance      `json:"instances"`
+	KeyPairs  map[string]*ec2meta.KeyPair       `json:"key_pairs"` // tenant + "/" + name
+	Images    map[string]*ec2meta.Image         `json:"images"`
+	Volumes   map[string]*ec2meta.Volume        `json:"volumes"`
+	Snapshots map[string]*ec2meta.Snapshot      `json:"snapshots"`
+	Tasks     map[string]*ec2meta.Task          `json:"tasks"`
+	VPCs      map[string]*ec2meta.VPC           `json:"vpcs"`
+	Subnets   map[string]*ec2meta.Subnet        `json:"subnets"`
+	Groups    map[string]*ec2meta.SecurityGroup `json:"groups"`
+	// NextVNI is the next VXLAN identifier to give a VPC.
+	NextVNI uint32 `json:"next_vni"`
 }
 
 func (e *ec2State) fill() {
@@ -107,6 +106,15 @@ func (e *ec2State) fill() {
 	if e.Tasks == nil {
 		e.Tasks = map[string]*ec2meta.Task{}
 	}
+	if e.VPCs == nil {
+		e.VPCs = map[string]*ec2meta.VPC{}
+	}
+	if e.Subnets == nil {
+		e.Subnets = map[string]*ec2meta.Subnet{}
+	}
+	if e.Groups == nil {
+		e.Groups = map[string]*ec2meta.SecurityGroup{}
+	}
 }
 
 func errCode(code, format string, args ...any) error {
@@ -121,6 +129,9 @@ func (f *fsm) applyEC2(c command) (any, error) {
 	if x == nil {
 		return nil, errors.New("control: missing ec2 command")
 	}
+	if res, ok, err := f.applyVPC(c); ok {
+		return res, err
+	}
 	switch c.Op {
 	case opRunInstances:
 		if len(x.Instances) == 0 {
@@ -129,15 +140,41 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		if img, ok := e.Images[x.Instances[0].ImageID]; !ok || !(img.Tenant == c.Owner || img.Public) || !img.Available() {
 			return nil, errCode(ec2meta.CodeInvalidAMIID, "image %s does not exist", x.Instances[0].ImageID)
 		}
+		first := x.Instances[0]
+		sn, ok := e.Subnets[first.SubnetID]
+		if !ok || sn.Tenant != c.Owner {
+			return nil, errCode(ec2meta.CodeSubnetNotFound, "the subnet ID '%s' does not exist", first.SubnetID)
+		}
+		if len(first.SecurityGroups) == 0 {
+			return nil, errCode(ec2meta.CodeInvalidParameter, "no security groups")
+		}
+		for _, id := range first.SecurityGroups {
+			if g, ok := e.Groups[id]; !ok || g.Tenant != c.Owner || g.VpcID != sn.VpcID {
+				return nil, errCode(ec2meta.CodeGroupNotFound, "the security group '%s' does not exist in VPC '%s'", id, sn.VpcID)
+			}
+		}
+		taken := map[string]bool{}
+		var out []ec2meta.Instance
 		for i := range x.Instances {
 			in := x.Instances[i]
 			if _, ok := e.Instances[in.ID]; ok {
 				return nil, fmt.Errorf("control: instance %s exists", in.ID)
 			}
+			ip, err := instanceIP(e, sn, taken)
+			if err != nil {
+				return nil, err
+			}
+			taken[ip] = true
 			in.Tenant, in.State, in.Changed = c.Owner, ec2meta.StatePending, c.Now
+			in.VpcID, in.SubnetID, in.SecurityGroups = sn.VpcID, sn.ID, first.SecurityGroups
+			in.PrivateIP, in.MAC = ip, macFor(in.ID)
+			out = append(out, in)
+		}
+		for i := range out {
+			in := out[i]
 			e.Instances[in.ID] = &in
 		}
-		return nil, nil
+		return out, nil
 
 	case opInstanceAction:
 		var resp ec2meta.ChangeResponse
@@ -164,31 +201,11 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		if !ok || in.State != ec2meta.StatePending || in.Host != "" {
 			return nil, errStale
 		}
-		m, ok := f.st.Members[x.Host]
-		if !ok {
+		if _, ok := f.st.Members[x.Host]; !ok {
 			return nil, errStale
 		}
-		if m.VMSubnet == "" {
-			p, err := hostSubnet(e.NextSubnet)
-			if err != nil {
-				return nil, err
-			}
-			e.NextSubnet++
-			nm := *m
-			nm.VMSubnet = p.String()
-			f.st.Members[x.Host] = &nm
-			m = &nm
-		}
-		ip := x.IP
-		if ip == "" {
-			free, err := freeIP(m.VMSubnet, e.Instances, x.Host)
-			if err != nil {
-				return nil, err
-			}
-			ip = free
-		}
 		n := *in
-		n.Host, n.PrivateIP, n.MAC, n.StateReason = x.Host, ip, x.MAC, ""
+		n.Host, n.StateReason = x.Host, ""
 		e.Instances[n.ID] = &n
 		return n, nil
 
@@ -200,8 +217,7 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		n := *in
 		switch n.State {
 		case ec2meta.StatePending:
-			n.Host, n.PrivateIP, n.MAC = "", "", ""
-			n.StateReason = x.Action
+			n.Host, n.StateReason = "", x.Action
 			detachAll(e, n.ID) // its volumes stay on the lost PC
 		case ec2meta.StateShuttingDown:
 			n.State, n.Changed, n.StateReason = ec2meta.StateTerminated, c.Now, x.Action
@@ -376,44 +392,6 @@ func hostTransition(from, to string) bool {
 	return false
 }
 
-// hostSubnet returns the i-th /24 of the VM network.
-func hostSubnet(i int) (netip.Prefix, error) {
-	n := 1 << (ec2meta.HostSubnetBits - vmNetwork.Bits())
-	if i >= n {
-		return netip.Prefix{}, errCode(ec2meta.CodeInsufficientCap, "no host subnets left")
-	}
-	base := vmNetwork.Addr().As4()
-	v := binary.BigEndian.Uint32(base[:]) + uint32(i)<<(32-ec2meta.HostSubnetBits)
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], v)
-	return netip.PrefixFrom(netip.AddrFrom4(b), ec2meta.HostSubnetBits), nil
-}
-
-// freeIP picks the lowest unused address from .10 up in a host's subnet.
-// .1 is the host's bridge.
-func freeIP(subnet string, instances map[string]*ec2meta.Instance, host string) (string, error) {
-	p, err := netip.ParsePrefix(subnet)
-	if err != nil {
-		return "", err
-	}
-	used := map[string]bool{}
-	for _, in := range instances {
-		if in.Host == host && in.State != ec2meta.StateTerminated {
-			used[in.PrivateIP] = true
-		}
-	}
-	a := p.Addr()
-	for i := 0; i < 10; i++ {
-		a = a.Next()
-	}
-	for ; p.Contains(a) && a.As4()[3] < 255; a = a.Next() {
-		if !used[a.String()] {
-			return a.String(), nil
-		}
-	}
-	return "", errCode(ec2meta.CodeInsufficientCap, "host %s has no free addresses", host)
-}
-
 func hasResource(e *ec2State, tenant, id string) bool {
 	switch {
 	case strings.HasPrefix(id, "i-"):
@@ -434,6 +412,15 @@ func hasResource(e *ec2State, tenant, id string) bool {
 	case strings.HasPrefix(id, "snap-"):
 		sn, ok := e.Snapshots[id]
 		return ok && sn.Tenant == tenant
+	case strings.HasPrefix(id, "vpc-"):
+		v, ok := e.VPCs[id]
+		return ok && v.Tenant == tenant
+	case strings.HasPrefix(id, "subnet-"):
+		v, ok := e.Subnets[id]
+		return ok && v.Tenant == tenant
+	case strings.HasPrefix(id, "sg-"):
+		v, ok := e.Groups[id]
+		return ok && v.Tenant == tenant
 	}
 	return false
 }
@@ -477,6 +464,18 @@ func setTags(e *ec2State, tenant, id string, tags map[string]string, del bool) {
 		n := *e.Snapshots[id]
 		n.Tags = mergeTags(n.Tags, tags, del)
 		e.Snapshots[id] = &n
+	case strings.HasPrefix(id, "vpc-"):
+		n := *e.VPCs[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.VPCs[id] = &n
+	case strings.HasPrefix(id, "subnet-"):
+		n := *e.Subnets[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.Subnets[id] = &n
+	case strings.HasPrefix(id, "sg-"):
+		n := *e.Groups[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.Groups[id] = &n
 	case strings.HasPrefix(id, "key-"):
 		for name, k := range e.KeyPairs {
 			if k.ID == id && k.Tenant == tenant {
@@ -520,6 +519,11 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 		return nil, errCode(ec2meta.CodeInvalidParameter, "root volume must be 1 to 2048 GiB")
 	}
 	t.VCPU, t.MemMiB = typ.VCPU, typ.MemMiB
+	if t.SubnetID == "" {
+		if _, err := s.DefaultVPC(tenant); err != nil {
+			return nil, err
+		}
+	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -553,6 +557,29 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 				}
 			}
 		}
+		if t.SubnetID == "" {
+			for _, sn := range st.EC2.Subnets {
+				if sn.Tenant == tenant && sn.IsDefault {
+					t.SubnetID = sn.ID
+				}
+			}
+		}
+		sn, ok := st.EC2.Subnets[t.SubnetID]
+		if !ok || sn.Tenant != tenant {
+			err = errCode(ec2meta.CodeSubnetNotFound, "the subnet ID '%s' does not exist", t.SubnetID)
+			return
+		}
+		if len(t.SecurityGroups) == 0 {
+			for _, g := range st.EC2.Groups {
+				if g.VpcID == sn.VpcID && g.Name == ec2meta.DefaultGroupName {
+					t.SecurityGroups = []string{g.ID}
+				}
+			}
+		}
+		if len(t.SecurityGroups) > 5 {
+			err = errCode("SecurityGroupsPerInstanceLimitExceeded", "at most 5 security groups per instance")
+			return
+		}
 		if !s.anyHostCouldRun(st, t) {
 			err = errCode(ec2meta.CodeInsufficientCap, "no compute host can run a %s instance with placement %s", t.Type, t.Placement)
 		}
@@ -579,12 +606,11 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 		in.Host, in.PrivateIP, in.MAC, in.RebootSeq = "", "", "", 0
 		ins = append(ins, in)
 	}
-	if _, err := s.ec2Apply(opRunInstances, tenant, ec2Command{Instances: ins}); err != nil {
+	out, err := s.ec2Apply(opRunInstances, tenant, ec2Command{Instances: ins})
+	if err != nil {
 		return nil, err
 	}
-	for i := range ins {
-		ins[i].Tenant, ins[i].State, ins[i].Changed = tenant, ec2meta.StatePending, now
-	}
+	ins = out.([]ec2meta.Instance)
 	s.kickScheduler()
 	return &ec2meta.RunResponse{Instances: ins}, nil
 }
@@ -850,7 +876,7 @@ func (s *Server) schedule() error {
 	isAlive := func(id string) bool { return alive == nil || alive[id] }
 	now := s.now()
 
-	type assignment struct{ id, host, mac string }
+	type assignment struct{ id, host string }
 	type unassign struct{ id, host, reason string }
 	var assigns []assignment
 	var drops []unassign
@@ -896,11 +922,11 @@ func (s *Server) schedule() error {
 			}
 			usedCPU[best] += in.VCPU
 			usedMem[best] += in.MemMiB
-			assigns = append(assigns, assignment{in.ID, best, macFor(in.ID)})
+			assigns = append(assigns, assignment{in.ID, best})
 		}
 	})
 	for _, a := range assigns {
-		if _, err := s.ec2Apply(opAssign, "", ec2Command{IDs: []string{a.id}, Host: a.host, MAC: a.mac}); err != nil && !errors.Is(err, errStale) {
+		if _, err := s.ec2Apply(opAssign, "", ec2Command{IDs: []string{a.id}, Host: a.host}); err != nil && !errors.Is(err, errStale) {
 			return err
 		}
 	}
@@ -929,13 +955,23 @@ func macFor(id string) string {
 // HostView returns what a compute host should be running.
 func (s *Server) HostView(host string) ec2meta.HostView {
 	var v ec2meta.HostView
+	v.Node = host
 	s.fsm.view(func(st *state) {
 		if m, ok := st.Members[host]; ok {
-			v.Subnet = m.VMSubnet
+			v.MeshIP = m.MeshIP
 		}
+		vpcs := map[string]bool{}
 		for _, in := range st.EC2.Instances {
 			if in.Host == host {
 				v.Instances = append(v.Instances, *in)
+				if in.State != ec2meta.StateTerminated {
+					vpcs[in.VpcID] = true
+				}
+			}
+		}
+		for id := range vpcs {
+			if n, ok := vpcNet(st, id, host); ok {
+				v.Networks = append(v.Networks, n)
 			}
 		}
 		for _, vol := range st.EC2.Volumes {
@@ -949,6 +985,7 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 			}
 		}
 	})
+	sort.Slice(v.Networks, func(i, j int) bool { return v.Networks[i].VPC.ID < v.Networks[j].VPC.ID })
 	sort.Slice(v.Volumes, func(i, j int) bool { return v.Volumes[i].ID < v.Volumes[j].ID })
 	sort.Slice(v.Tasks, func(i, j int) bool { return v.Tasks[i].ID < v.Tasks[j].ID })
 	sort.Slice(v.Instances, func(i, j int) bool { return v.Instances[i].ID < v.Instances[j].ID })

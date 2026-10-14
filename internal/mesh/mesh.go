@@ -16,8 +16,6 @@ import (
 
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/jibzmat/JunkyardServers/internal/cluster"
 )
 
 // DefaultInterface is the mesh interface name.
@@ -32,9 +30,7 @@ type Peer struct {
 	PublicKey string // base64 WireGuard public key
 	Endpoint  string // host:port, empty if the peer is not directly reachable
 	MeshIP    string
-	// Subnets are instance subnets on the peer (its VM subnet).
-	Subnets []string
-	// Relayed lists other nodes' mesh IPs (and instance subnets) routed
+	// Relayed lists other nodes' mesh IPs routed
 	// through this peer, when it acts as a relay for nodes we can't reach
 	// directly.
 	Relayed []string
@@ -79,7 +75,7 @@ func (c Config) WGQuick() string {
 	fmt.Fprintf(&b, "[Interface]\nPrivateKey = %s\nAddress = %s/%d\nListenPort = %d\n", c.PrivateKey, c.MeshIP, prefixBits, c.ListenPort)
 	for _, p := range sortedPeers(c.Peers) {
 		allowed := p.MeshIP + "/32"
-		for _, r := range append(append([]string(nil), p.Subnets...), p.Relayed...) {
+		for _, r := range p.Relayed {
 			if !strings.Contains(r, "/") {
 				r += "/32"
 			}
@@ -104,7 +100,7 @@ func (p Peer) peerConfig() (wgtypes.PeerConfig, error) {
 		return wgtypes.PeerConfig{}, err
 	}
 	allowed := []net.IPNet{hostNet(ip)}
-	for _, r := range append(append([]string(nil), p.Subnets...), p.Relayed...) {
+	for _, r := range p.Relayed {
 		if pfx, err := netip.ParsePrefix(r); err == nil {
 			allowed = append(allowed, net.IPNet{IP: pfx.Masked().Addr().AsSlice(), Mask: net.CIDRMask(pfx.Bits(), pfx.Addr().BitLen())})
 			continue
@@ -181,12 +177,6 @@ func Up(name string, cfg Config) (*Device, error) {
 		return nil, err
 	}
 	if err := run("ip", "link", "set", "up", "dev", name); err != nil {
-		wg.Close()
-		return nil, err
-	}
-	// Instances on other PCs are reached over the mesh; a compute host's
-	// own subnet is on its bridge, a more specific route.
-	if err := run("ip", "route", "replace", cluster.VMCIDR, "dev", name); err != nil {
 		wg.Close()
 		return nil, err
 	}

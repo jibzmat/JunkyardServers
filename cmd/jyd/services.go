@@ -18,6 +18,7 @@ import (
 	"github.com/jibzmat/JunkyardServers/internal/pki"
 	"github.com/jibzmat/JunkyardServers/internal/s3gw"
 	"github.com/jibzmat/JunkyardServers/internal/storage"
+	"github.com/jibzmat/JunkyardServers/internal/vnet"
 )
 
 // mayDelete lets control nodes and owner-trusted gateways delete shards.
@@ -123,7 +124,13 @@ func startCompute(ctx context.Context, dir string, a *agent.Agent, emulate bool,
 		logger.Printf("compute: not running instances: %v", err)
 		return
 	}
-	h := &compute.Host{Control: a.Client(), Driver: q, Dir: filepath.Join(dir, "compute"), Logger: logger, Metadata: true}
+	if err := vnet.Check(); err != nil {
+		logger.Printf("compute: not running instances: %v", err)
+		return
+	}
+	cdir := filepath.Join(dir, "compute")
+	h := &compute.Host{Control: a.Client(), Driver: q, Dir: cdir, Logger: logger, Metadata: true,
+		Net: &vnet.Manager{Dir: cdir, Logger: logger}}
 	logger.Printf("compute: running instances (emulated: %v)", emulate)
 	go h.Run(ctx, 3*time.Second)
 }

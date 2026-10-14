@@ -8,7 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net/netip"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/ec2meta"
+	"github.com/jibzmat/JunkyardServers/internal/vnet"
 )
 
 // VM is an instance as this host runs it.
 type VM struct {
 	Instance ec2meta.Instance
-	Subnet   string // the host's instance subnet
+	Subnet   string // the instance's subnet, e.g. 172.31.0.0/20
+	NetNS    string // the network namespace of its VPC
 	Dir      string // disk, seed, console log, QMP socket, PID file
 	// Volumes are the volumes attached, attaching or detaching.
 	Volumes []ec2meta.Volume
@@ -38,7 +40,6 @@ type Disk struct {
 
 // Driver runs VMs. QEMU is the real one.
 type Driver interface {
-	Network(ctx context.Context, subnet netip.Prefix) error
 	ConvertImage(ctx context.Context, src, format, dst string) error
 	Prepare(ctx context.Context, vm *VM, image string) error
 	Start(ctx context.Context, vm *VM) error
@@ -74,6 +75,14 @@ type Control interface {
 	SendConsole(ctx context.Context, c ec2meta.ConsoleOutput) error
 }
 
+// Network is the PC's VPC networking; *vnet.Manager implements it.
+type Network interface {
+	Sync(ctx context.Context, node, meshIP string, nets []ec2meta.VPCNet) error
+	Plug(ctx context.Context, vpcID, tap, ip string) error
+	Unplug(tap string)
+	Listen(vpcID, addr string) (net.Listener, error)
+}
+
 // Host reconciles this PC's VMs with the control plane.
 type Host struct {
 	Control Control
@@ -84,6 +93,8 @@ type Host struct {
 	Metadata bool
 	// Region is reported to instances; default us-east-1.
 	Region string
+	// Net runs VPC networking; nil runs instances without (tests).
+	Net Network
 
 	mu       sync.Mutex
 	busy     map[string]bool
@@ -95,7 +106,6 @@ type Host struct {
 	consoles map[string]consoleSent
 	byIP     map[string]ec2meta.Instance // for the metadata service
 	meta     *metadataServer
-	subnet   string
 	inflight sync.WaitGroup
 }
 
@@ -142,27 +152,28 @@ func (h *Host) Step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if v.Subnet != "" && v.Subnet != h.currentSubnet() {
-		p, err := netip.ParsePrefix(v.Subnet)
-		if err != nil {
-			return err
-		}
-		if err := h.Driver.Network(ctx, p); err != nil {
-			return err
+	var netErr error
+	if h.Net != nil {
+		// A VPC that fails to set up fails its instances' starts; the
+		// others carry on.
+		netErr = h.Net.Sync(ctx, v.Node, v.MeshIP, v.Networks)
+		if netErr != nil && ctx.Err() == nil {
+			h.logf("compute: networking: %v", netErr)
 		}
 		if h.Metadata {
-			if err := h.startMetadata(ctx, p); err != nil {
-				return err
-			}
+			h.syncMetadata(ctx, v.Networks)
 		}
-		h.mu.Lock()
-		h.subnet = v.Subnet
-		h.mu.Unlock()
+	}
+	subnets := map[string]string{}
+	for _, n := range v.Networks {
+		for _, sn := range n.Subnets {
+			subnets[sn.ID] = sn.CIDR
+		}
 	}
 	byIP := map[string]ec2meta.Instance{}
 	for _, in := range v.Instances {
 		if in.PrivateIP != "" && in.State != ec2meta.StateTerminated {
-			byIP[in.PrivateIP] = in
+			byIP[in.VpcID+"/"+in.PrivateIP] = in
 		}
 	}
 	h.mu.Lock()
@@ -178,7 +189,7 @@ func (h *Host) Step(ctx context.Context) error {
 	assigned := map[string]bool{}
 	for _, in := range v.Instances {
 		assigned[in.ID] = true
-		vm := &VM{Instance: in, Subnet: v.Subnet, Dir: h.instanceDir(in.ID), Volumes: attached[in.ID]}
+		vm := &VM{Instance: in, Subnet: subnets[in.SubnetID], NetNS: vnet.NSName(in.VpcID), Dir: h.instanceDir(in.ID), Volumes: attached[in.ID]}
 		todo := tasks[in.ID]
 		h.spawn(ctx, in.ID, func(ctx context.Context) {
 			h.reconcile(ctx, vm)
@@ -220,12 +231,6 @@ func (h *Host) Step(ctx context.Context) error {
 		h.spawn(ctx, id, func(ctx context.Context) { h.destroy(ctx, vm) })
 	}
 	return nil
-}
-
-func (h *Host) currentSubnet() string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.subnet
 }
 
 func (h *Host) instanceDir(id string) string { return filepath.Join(h.Dir, "instances", id) }
@@ -336,7 +341,7 @@ func (h *Host) reconcile(ctx context.Context, vm *VM) {
 // start prepares and boots an instance.
 func (h *Host) start(ctx context.Context, vm *VM) error {
 	if vm.Instance.PrivateIP == "" || vm.Subnet == "" {
-		return errors.New("no address assigned yet")
+		return errors.New("the instance's subnet is unknown")
 	}
 	img, err := h.image(ctx, vm.Instance.ImageID)
 	if err != nil {
@@ -365,7 +370,13 @@ func (h *Host) boot(ctx context.Context, vm *VM) error {
 		}
 		vm.Disks = append(vm.Disks, Disk{ID: v.ID, Path: path})
 	}
-	return h.Driver.Start(ctx, vm)
+	if err := h.Driver.Start(ctx, vm); err != nil {
+		return err
+	}
+	if h.Net != nil {
+		return h.Net.Plug(ctx, vm.Instance.VpcID, vnet.TapName(vm.Instance.ID), vm.Instance.PrivateIP)
+	}
+	return nil
 }
 
 // image returns the path of the cached qcow2 for an image, downloading and
@@ -419,6 +430,9 @@ func (h *Host) destroy(ctx context.Context, vm *VM) bool {
 	if err := h.Driver.Destroy(ctx, vm); err != nil {
 		h.logf("compute: destroying %s: %v", vm.Instance.ID, err)
 		return false
+	}
+	if h.Net != nil {
+		h.Net.Unplug(vnet.TapName(vm.Instance.ID))
 	}
 	if err := os.RemoveAll(vm.Dir); err != nil {
 		h.logf("compute: removing %s: %v", vm.Dir, err)
