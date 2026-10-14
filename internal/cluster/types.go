@@ -129,10 +129,13 @@ func (p Placement) Allows(host Tier, hostConfidential bool) bool {
 
 // Member is the control plane's record of a node.
 type Member struct {
-	NodeID     string `json:"node_id"`
-	Roles      []Role `json:"roles"`
-	Tier       Tier   `json:"tier"`
-	MeshIP     string `json:"mesh_ip"`
+	NodeID string `json:"node_id"`
+	Roles  []Role `json:"roles"`
+	Tier   Tier   `json:"tier"`
+	MeshIP string `json:"mesh_ip"`
+	// VMSubnet is the subnet this compute host's instances get addresses
+	// from, routed to it over the mesh. Set when it is first scheduled.
+	VMSubnet   string `json:"vm_subnet,omitempty"`
 	WGPublic   string `json:"wg_public"`             // base64 WireGuard public key
 	WGEndpoint string `json:"wg_endpoint,omitempty"` // public host:port, if reachable
 	GossipAddr string `json:"gossip_addr,omitempty"` // host:port for memberlist
@@ -152,6 +155,10 @@ func (m Member) Has(r Role) bool {
 	}
 	return false
 }
+
+// VMCIDR is the address space of instances: one /24 per compute host,
+// routed to that host over the mesh.
+const VMCIDR = "10.128.0.0/9"
 
 // JoinRequest is sent by a new node to the control plane.
 type JoinRequest struct {

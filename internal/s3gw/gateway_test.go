@@ -148,7 +148,7 @@ func (e *env) doAs(akid, secret, method, target string, body []byte, hdr map[str
 		signed + "\n" + hex.EncodeToString(sum[:])
 	cs := sha256.Sum256([]byte(canon))
 	scope := day + "/us-east-1/s3/aws4_request"
-	sig := hex.EncodeToString(hmacSHA256(signingKey(secret, day, "us-east-1"), algorithm+"\n"+now.Format(timeFormat)+"\n"+scope+"\n"+hex.EncodeToString(cs[:])))
+	sig := hex.EncodeToString(hmacSHA256(signingKey(secret, day, "us-east-1", "s3"), algorithm+"\n"+now.Format(timeFormat)+"\n"+scope+"\n"+hex.EncodeToString(cs[:])))
 	req.Header.Set("Authorization", algorithm+" Credential="+akid+"/"+scope+", SignedHeaders="+signed+", Signature="+sig)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

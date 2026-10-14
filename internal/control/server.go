@@ -85,6 +85,11 @@ type Server struct {
 	kekMu               sync.Mutex
 	kek                 []byte
 	kekEpoch            int
+
+	// Compute (ec2.go).
+	computeMu sync.Mutex
+	compute   ComputeOptions
+	schedKick chan struct{}
 }
 
 // AdminCredentials is the certificate an operator's jyctl uses.
@@ -206,6 +211,7 @@ func open(dir string, bootstrap bool, logger *log.Logger) (*Server, error) {
 		sharePub:  sharePub,
 		sharePriv: sharePriv,
 		done:      make(chan struct{}),
+		schedKick: make(chan struct{}, 1),
 		dir:       dir,
 		info:      info,
 		ca:        ca,
@@ -392,6 +398,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/controls/activate", s.requireKind(s.leaderOnly(s.handleControlActivate), pki.KindControl))
 	mux.HandleFunc("DELETE /v1/controls/{id}", s.requireKind(s.leaderOnly(s.handleControlRemove), pki.KindAdmin))
 	s.s3Routes(mux)
+	s.ec2Routes(mux)
 	s.keyRoutes(mux)
 	return mux
 }

@@ -29,6 +29,7 @@ func main() {
 	wg := flag.Bool("wireguard", true, "bring up the kernel WireGuard mesh (needs root)")
 	iface := flag.String("interface", "jy0", "mesh interface name")
 	verbose := flag.Bool("v", false, "log Raft internals")
+	emulate := flag.Bool("emulate", false, "run instances under QEMU's emulator on PCs without KVM (slow; for trying things out)")
 	repairAfter := flag.Duration("repair-after", repair.DefaultAfter, "rebuild a storage node's shards elsewhere after it has been unreachable this long")
 	flag.Parse()
 
@@ -92,6 +93,10 @@ func main() {
 			Logger: logger,
 		}
 		go r.Run(ctx, time.Minute, ctl.IsLeader)
+		ctl.StartCompute(control.ComputeOptions{Alive: a.Alive, AllowEmulation: *emulate, Store: r.Store})
+	}
+	if hasRole(n.Config.Roles, cluster.RoleCompute) {
+		startCompute(ctx, *dir, a, *emulate, logger)
 	}
 	if err := a.Run(ctx); err != nil {
 		logger.Fatal(err)

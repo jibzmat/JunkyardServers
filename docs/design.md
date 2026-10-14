@@ -84,6 +84,28 @@ the control plane registry.
   flight. Nodes are listed before metadata is read, so a shard recorded
   after the read is never older than the listing says.
 
+## Compute (M2)
+
+- EC2 Query API on the gateway port, told apart from S3 by the signature's
+  service (`ec2`). Instances, key pairs and images are in the Raft state.
+- Images: RegisterImage copies an S3 object (qcow2 or raw) into a hidden
+  `_images` bucket, so the bytes are encrypted and erasure-coded and repair,
+  re-coding and GC cover them. Control nodes stream an image to a compute
+  host only while it runs an instance of it.
+- Scheduler (control leader): pending instances go to the least-loaded live
+  compute host the placement allows (`private`: trusted or confidential
+  tiers; `any`: all; `confidential`: confidential tier) with room: vCPUs
+  overcommitted 4x, memory not overcommitted, 1 GiB left for the host. A
+  pending instance on a host gone for 2 minutes is rescheduled.
+- Hosts poll for their instances, run them as daemonised QEMU processes
+  (surviving jyd restarts) with a qcow2 overlay on the cached image and a
+  cloud-init NoCloud seed (key pair, user data, static network config),
+  and report state changes; the control plane accepts only transitions a
+  host may make.
+- Networking: each compute host gets a /24 of 10.128.0.0/9 on first use,
+  served on a bridge (host = .1), routed to it over WireGuard (the subnet is
+  in the peer's AllowedIPs) and NATed for traffic leaving the cluster.
+
 ## Roadmap
 
 | Milestone | Scope | Exit test |

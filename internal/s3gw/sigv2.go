@@ -116,7 +116,7 @@ func verifyV2(ctx context.Context, r *http.Request, lookup Lookup, now time.Time
 	if !hmac.Equal([]byte(want), []byte(sig)) {
 		return nil, errf("SignatureDoesNotMatch", http.StatusForbidden, "the request signature does not match; check your secret key and signing method")
 	}
-	return &Auth{AccessKeyID: akid, Tenant: tenant, PayloadHash: payloadUnsigned}, nil
+	return &Auth{AccessKeyID: akid, Tenant: tenant, Service: "s3", PayloadHash: payloadUnsigned}, nil
 }
 
 // parseHTTPDate also accepts numeric zones ("+0000"), which SigV2 clients send.

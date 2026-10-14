@@ -412,16 +412,18 @@ func ApplyRoutes(peers []mesh.Peer, routes []nat.Route) []mesh.Peer {
 		byID[p.NodeID] = len(out)
 		out = append(out, p)
 	}
-	ips := map[string]string{}
+	byNode := map[string]mesh.Peer{}
 	for _, p := range peers {
-		ips[p.NodeID] = p.MeshIP
+		byNode[p.NodeID] = p
 	}
 	for _, r := range routes {
 		if r.Mode != nat.Relayed {
 			continue
 		}
 		if i, ok := byID[r.Via]; ok {
-			out[i].Relayed = append(out[i].Relayed, ips[r.NodeID])
+			p := byNode[r.NodeID]
+			out[i].Relayed = append(out[i].Relayed, p.MeshIP)
+			out[i].Relayed = append(out[i].Relayed, p.Subnets...)
 		}
 	}
 	return out
@@ -461,7 +463,11 @@ func Peers(registry []cluster.Member, alive []membership.Meta, self string) []me
 		if live, ok := endpoints[m.NodeID]; ok {
 			ep = live
 		}
-		out = append(out, mesh.Peer{NodeID: m.NodeID, PublicKey: m.WGPublic, Endpoint: ep, MeshIP: m.MeshIP})
+		p := mesh.Peer{NodeID: m.NodeID, PublicKey: m.WGPublic, Endpoint: ep, MeshIP: m.MeshIP}
+		if m.VMSubnet != "" {
+			p.Subnets = []string{m.VMSubnet}
+		}
+		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out

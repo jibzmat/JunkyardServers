@@ -1,10 +1,12 @@
 package s3gw
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -39,6 +41,8 @@ type Auth struct {
 	// PayloadHash is the x-amz-content-sha256 value (UNSIGNED-PAYLOAD for
 	// presigned URLs).
 	PayloadHash string
+	// Service is the signing scope's service: s3, or ec2 for the EC2 API.
+	Service string
 
 	signingKey []byte
 	amzDate    string
@@ -91,6 +95,21 @@ func verify(ctx context.Context, r *http.Request, lookup Lookup, now time.Time, 
 		return nil, errf("RequestTimeTooSkewed", http.StatusForbidden, "request time differs from server time by more than 15 minutes")
 	}
 	payload := r.Header.Get("X-Amz-Content-Sha256")
+	if payload == "" && scopeService(cred) == "ec2" {
+		// EC2 query requests carry no payload hash header: the signature
+		// covers the hash of the (small, form-encoded) body.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxEC2Body+1))
+		if err != nil {
+			return nil, errf("IncompleteBody", http.StatusBadRequest, "reading request body: %v", err)
+		}
+		if len(body) > maxEC2Body {
+			return nil, errf("InvalidRequest", http.StatusRequestEntityTooLarge, "request body too large")
+		}
+		sum := sha256.Sum256(body)
+		payload = hex.EncodeToString(sum[:])
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
 	if payload == "" {
 		return nil, errf("InvalidRequest", http.StatusBadRequest, "missing x-amz-content-sha256")
 	}
@@ -140,10 +159,10 @@ func verifyPresigned(ctx context.Context, r *http.Request, lookup Lookup, now ti
 // check recomputes the signature.
 func check(ctx context.Context, r *http.Request, lookup Lookup, cred, signedHeaders, sig, amzDate, payload, skipQuery string) (*Auth, error) {
 	parts := strings.Split(cred, "/")
-	if len(parts) != 5 || parts[3] != "s3" || parts[4] != "aws4_request" {
+	if len(parts) != 5 || (parts[3] != "s3" && parts[3] != "ec2") || parts[4] != "aws4_request" {
 		return nil, errf("AuthorizationHeaderMalformed", http.StatusBadRequest, "bad credential scope %q", cred)
 	}
-	akid, day, region := parts[0], parts[1], parts[2]
+	akid, day, region, service := parts[0], parts[1], parts[2], parts[3]
 	if !strings.HasPrefix(amzDate, day) {
 		return nil, errf("AuthorizationHeaderMalformed", http.StatusBadRequest, "credential date does not match X-Amz-Date")
 	}
@@ -151,7 +170,7 @@ func check(ctx context.Context, r *http.Request, lookup Lookup, cred, signedHead
 	if err != nil {
 		return nil, err
 	}
-	scope := day + "/" + region + "/s3/aws4_request"
+	scope := day + "/" + region + "/" + service + "/aws4_request"
 
 	headers := strings.Split(signedHeaders, ";")
 	if !sort.StringsAreSorted(headers) || !contains(headers, "host") {
@@ -168,18 +187,30 @@ func check(ctx context.Context, r *http.Request, lookup Lookup, cred, signedHead
 
 	sum := sha256.Sum256([]byte(canon.String()))
 	toSign := algorithm + "\n" + amzDate + "\n" + scope + "\n" + hex.EncodeToString(sum[:])
-	key := signingKey(secret, day, region)
+	key := signingKey(secret, day, region, service)
 	want := hex.EncodeToString(hmacSHA256(key, toSign))
 	if !hmac.Equal([]byte(want), []byte(sig)) {
 		return nil, errf("SignatureDoesNotMatch", http.StatusForbidden, "the request signature does not match; check your secret key and signing method")
 	}
-	return &Auth{AccessKeyID: akid, Tenant: tenant, signingKey: key, amzDate: amzDate, scope: scope, signature: sig}, nil
+	return &Auth{AccessKeyID: akid, Tenant: tenant, Service: service, signingKey: key, amzDate: amzDate, scope: scope, signature: sig}, nil
 }
 
-func signingKey(secret, day, region string) []byte {
+// maxEC2Body bounds an EC2 query request (user data is at most 16 KB,
+// base64 encoded).
+const maxEC2Body = 1 << 20
+
+func scopeService(cred string) string {
+	parts := strings.Split(cred, "/")
+	if len(parts) != 5 {
+		return ""
+	}
+	return parts[3]
+}
+
+func signingKey(secret, day, region, service string) []byte {
 	k := hmacSHA256([]byte("AWS4"+secret), day)
 	k = hmacSHA256(k, region)
-	k = hmacSHA256(k, "s3")
+	k = hmacSHA256(k, service)
 	return hmacSHA256(k, "aws4_request")
 }
 

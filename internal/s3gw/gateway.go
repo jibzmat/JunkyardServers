@@ -56,7 +56,9 @@ const credTTL = time.Minute
 
 // Gateway serves the S3 API.
 type Gateway struct {
-	Meta  Meta
+	Meta Meta
+	// EC2 serves the EC2 API on the same port when set.
+	EC2   EC2Meta
 	Store *storage.Store
 	// Region is reported to clients; any region in a signature is accepted.
 	Region string
@@ -130,6 +132,7 @@ type request struct {
 	bucket string
 	key    string
 	id     string
+	ec2    bool
 }
 
 // ServeHTTP authenticates and dispatches a request.
@@ -137,7 +140,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id := newID(8)
 	w.Header().Set("x-amz-request-id", id)
 	w.Header().Set("Server", "JunkyardServers")
-	req := &request{w: w, r: r, ctx: r.Context(), id: id}
+	req := &request{w: w, r: r, ctx: r.Context(), id: id, ec2: isEC2(r)}
 	var vhost bool
 	req.bucket, req.key, vhost = g.route(r)
 
@@ -151,6 +154,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.auth, req.tenant = auth, auth.Tenant
+	if auth.Service == "ec2" {
+		if err := g.serveEC2(req); err != nil {
+			g.fail(req, err)
+		}
+		return
+	}
 	if err := g.dispatch(req); err != nil {
 		g.fail(req, err)
 	}
@@ -377,6 +386,15 @@ func (g *Gateway) fail(q *request, err error) {
 	default:
 		g.logf("s3: %s %s: %v", q.r.Method, q.r.URL.Path, err)
 		e = errf("InternalError", http.StatusInternalServerError, "internal error")
+	}
+	if q.ec2 {
+		if e.Code == "AccessDenied" || e.Code == "SignatureDoesNotMatch" || e.Code == s3meta.CodeInvalidAccessKey {
+			e = errf("AuthFailure", http.StatusUnauthorized, "%s", e.Message)
+		} else if e.Status == http.StatusNotFound || e.Status == http.StatusConflict {
+			e.Status = http.StatusBadRequest
+		}
+		g.ec2Fail(q, e)
+		return
 	}
 	if q.r.Method == http.MethodHead {
 		q.w.WriteHeader(e.Status)

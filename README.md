@@ -6,9 +6,9 @@ traffic and guest RAM are encrypted; PCs contributed by strangers only ever hold
 ciphertext. Strangers' PCs get the same storage and compute features as your
 own; the only difference is encrypted guest RAM, which needs SEV-SNP or TDX.
 
-This repository has finished **M0 (mesh and cluster bootstrap)** and has the
-core of **M1 (encrypted S3 storage)**: the stock `aws s3` and `aws s3api`
-commands work against it. See [docs/design.md](docs/design.md) for the
+This repository has finished **M0 (mesh and cluster bootstrap)** and **M1
+(encrypted S3 storage)**, and has the core of **M2 (EC2)**: the stock
+`aws s3`, `aws s3api` and `aws ec2` commands work against it. See [docs/design.md](docs/design.md) for the
 architecture and roadmap.
 
 ## What M0 does
@@ -83,6 +83,40 @@ aws --endpoint-url http://192.168.1.10:9000 s3 mb s3://photos
 aws --endpoint-url http://192.168.1.10:9000 s3 sync ~/Pictures s3://photos/
 ```
 
+## What M2 adds: EC2
+
+```sh
+aws s3 cp noble-server-cloudimg-amd64.img s3://images/noble.img
+aws ec2 register-image --name noble --image-location images/noble.img
+aws ec2 create-key-pair --key-name me --key-type ed25519 \
+    --query KeyMaterial --output text > me.pem
+aws ec2 run-instances --image-id ami-… --instance-type t3.small --key-name me
+aws ec2 describe-instances --query 'Reservations[].Instances[].PrivateIpAddress'
+ssh -i me.pem ubuntu@10.128.0.10     # from any PC on the mesh
+```
+
+(all with `--endpoint-url http://<gateway>:9000`)
+
+- Instances are QEMU VMs with KVM on PCs holding the compute role. Images
+  are any qcow2 or raw cloud image registered from S3; the bytes are copied,
+  encrypted and erasure-coded like any object, and cached on each host.
+- Supported: run, describe (with filters), stop, start, reboot, terminate,
+  describe-instance-status, key pairs (create, import, describe, delete),
+  register/describe/deregister images, tags, regions, zones and instance
+  types (t3, m5, c5, r5 sizes). `aws ec2 wait` works.
+- cloud-init gets the key pair, user data and a static address. Each
+  compute PC hands its instances addresses from its own /24 in 10.128.0.0/9,
+  routed over the WireGuard mesh, and NATs their traffic to the internet.
+- Placement is the `jy:placement` tag: `private` (default: your PCs),
+  `any` (strangers' PCs too) or `confidential` (SEV-SNP/TDX, once
+  attestation lands). A launch no PC can take fails with
+  InsufficientInstanceCapacity.
+- A shutdown from inside the guest stops the instance, as on EC2. Disks are
+  local to the PC (instance store); they survive stop and start.
+- Compute PCs need `qemu-system-x86_64`, `qemu-img`, `genisoimage` (or
+  `mkisofs`/`xorriso`), `iproute2` and `iptables`. `jyd -emulate` runs guests
+  without KVM, very slowly, for trying things out.
+
 ## Try it
 
 Needs Go 1.25+, Linux, and for the mesh: root plus the `wireguard` kernel
@@ -131,7 +165,9 @@ internal/mesh/        WireGuard mesh
 internal/agent/       jyd main loop
 internal/storage/     object encryption, erasure coding, placement, shard servers
 internal/s3meta/      S3 metadata types (tenants, buckets, objects, uploads)
-internal/s3gw/        S3 gateway: SigV4/SigV2, buckets, objects, multipart
+internal/s3gw/        S3 and EC2 gateway: SigV4/SigV2, buckets, objects, multipart, EC2 Query API
+internal/ec2meta/     EC2 records (instances, key pairs, images)
+internal/compute/     compute host: QEMU driver, cloud-init seed, VM networking
 internal/repair/      rebuilds shards lost with storage PCs
 internal/shamir/      Shamir secret sharing
 internal/cluster/     shared types: roles, trust tiers
@@ -145,6 +181,18 @@ go vet ./... && go test -race ./...
 ```
 
 ## Not yet done
+
+M2:
+
+- EBS volumes (instances have local disks only), snapshots and AMIs made
+  from instances.
+- SEV-SNP/TDX attestation, so `confidential` placement has no hosts yet.
+- Security groups and isolation between instances on one PC (M3); today
+  every instance can reach every other instance on the mesh.
+- Instances on a PC that dies are not restarted elsewhere (M4).
+- Public IPs (M5); instances are reached from PCs on the mesh.
+- GetConsoleOutput, instance metadata service (169.254.169.254), spot,
+  launch templates.
 
 M1:
 

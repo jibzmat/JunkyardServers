@@ -13,6 +13,7 @@ import (
 
 	"github.com/jibzmat/JunkyardServers/internal/agent"
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
+	"github.com/jibzmat/JunkyardServers/internal/compute"
 	"github.com/jibzmat/JunkyardServers/internal/node"
 	"github.com/jibzmat/JunkyardServers/internal/pki"
 	"github.com/jibzmat/JunkyardServers/internal/s3gw"
@@ -78,6 +79,7 @@ func scrub(st *storage.ShardStore, logger *log.Logger) {
 func startGateway(n *node.Node, a *agent.Agent, logger *log.Logger) (*http.Server, *s3gw.Gateway, error) {
 	gw := &s3gw.Gateway{
 		Meta: a.Client(), // follows control nodes being added and removed
+		EC2:  a.Client(),
 		Store: &storage.Store{
 			Client: storage.NewShardClient(n.TLSCertificate(), n.CA),
 			Nodes:  func() []storage.Node { return storageNodes(a) },
@@ -112,4 +114,16 @@ func storageNodes(a *agent.Agent) []storage.Node {
 		}
 	}
 	return out
+}
+
+// startCompute runs this PC's instances, if it has what that takes.
+func startCompute(ctx context.Context, dir string, a *agent.Agent, emulate bool, logger *log.Logger) {
+	q := &compute.QEMU{Emulate: emulate}
+	if err := q.Check(); err != nil {
+		logger.Printf("compute: not running instances: %v", err)
+		return
+	}
+	h := &compute.Host{Control: a.Client(), Driver: q, Dir: filepath.Join(dir, "compute"), Logger: logger}
+	logger.Printf("compute: running instances (emulated: %v)", emulate)
+	go h.Run(ctx, 3*time.Second)
 }
