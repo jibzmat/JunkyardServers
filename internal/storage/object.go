@@ -256,8 +256,28 @@ func (s *Store) addrs() map[string]Node {
 	return out
 }
 
-// getChunk fetches shards in parallel and decodes as soon as k have arrived.
+// getChunk fetches a chunk's shards, decodes and decrypts it.
 func (s *Store) getChunk(ctx context.Context, objectID string, key ObjectKey, layout Layout, idx uint64, c ChunkRef, addrs map[string]Node) ([]byte, error) {
+	sealed, err := s.getSealed(ctx, layout, idx, c, addrs)
+	if err != nil {
+		return nil, err
+	}
+	return OpenChunk(key, objectID, idx, sealed)
+}
+
+// RebuildChunk recomputes every shard of a chunk from any k reachable ones.
+// It needs no keys: coding works on ciphertext. Reed-Solomon coding is
+// deterministic, so rebuilt shards hash the same as the originals.
+func (s *Store) RebuildChunk(ctx context.Context, layout Layout, idx int, c ChunkRef) ([][]byte, error) {
+	sealed, err := s.getSealed(ctx, layout, uint64(idx), c, s.addrs())
+	if err != nil {
+		return nil, err
+	}
+	return Encode(sealed, layout.DataShards, layout.ParityShards)
+}
+
+// getSealed fetches shards in parallel and decodes as soon as k have arrived.
+func (s *Store) getSealed(ctx context.Context, layout Layout, idx uint64, c ChunkRef, addrs map[string]Node) ([]byte, error) {
 	k, m := layout.DataShards, layout.ParityShards
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -295,11 +315,7 @@ func (s *Store) getChunk(ctx context.Context, objectID string, key ObjectKey, la
 	if have < k {
 		return nil, fmt.Errorf("storage: chunk %d: only %d of %d needed shards reachable", idx, have, k)
 	}
-	sealed, err := Decode(shards, k, m, c.SealedSize)
-	if err != nil {
-		return nil, err
-	}
-	return OpenChunk(key, objectID, idx, sealed)
+	return Decode(shards, k, m, c.SealedSize)
 }
 
 // Delete removes an object's shards. Unreachable nodes keep orphaned

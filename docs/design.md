@@ -55,6 +55,12 @@ the control plane registry.
   are ciphertext named by hash) but deletes only from control nodes and
   trusted gateways. Clients check the server certificate against the node's
   mesh IP, which WireGuard binds to the node's key.
+- Repair: the control leader tracks when each storage node was last alive.
+  After 15 minutes gone, it rebuilds each affected chunk from k shards
+  (decode, re-encode; coding is deterministic so hashes match) onto nodes
+  holding no shard of that chunk, and records the moves in one Raft write
+  per segment. The write is refused if the object changed meanwhile, and the
+  new shards are then deleted.
 
 ## Roadmap
 

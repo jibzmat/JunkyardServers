@@ -20,6 +20,8 @@ import (
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
 	"github.com/jibzmat/JunkyardServers/internal/control"
 	"github.com/jibzmat/JunkyardServers/internal/node"
+	"github.com/jibzmat/JunkyardServers/internal/repair"
+	"github.com/jibzmat/JunkyardServers/internal/storage"
 )
 
 func main() {
@@ -27,6 +29,7 @@ func main() {
 	wg := flag.Bool("wireguard", true, "bring up the kernel WireGuard mesh (needs root)")
 	iface := flag.String("interface", "jy0", "mesh interface name")
 	verbose := flag.Bool("v", false, "log Raft internals")
+	repairAfter := flag.Duration("repair-after", repair.DefaultAfter, "rebuild a storage node's shards elsewhere after it has been unreachable this long")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "jyd: ", log.LstdFlags|log.Lmsgprefix)
@@ -40,6 +43,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var ctl *control.Server
 	controlDir := filepath.Join(*dir, "control")
 	if _, err := os.Stat(filepath.Join(controlDir, "control.json")); err == nil {
 		var raftLog *log.Logger
@@ -51,6 +55,7 @@ func main() {
 			logger.Fatalf("control plane: %v", err)
 		}
 		defer srv.Close()
+		ctl = srv
 		go func() {
 			logger.Printf("control node %s serving on %s", srv.ID(), srv.APIAddr())
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -75,6 +80,18 @@ func main() {
 		}
 		defer gw.Wait()
 		defer srv.Close()
+	}
+	if ctl != nil {
+		r := &repair.Repairer{
+			Meta: ctl,
+			Store: &storage.Store{
+				Client: storage.NewShardClient(ctl.ClientCertificate(), ctl.CA()),
+				Nodes:  func() []storage.Node { return storageNodes(a) },
+			},
+			After:  *repairAfter,
+			Logger: logger,
+		}
+		go r.Run(ctx, time.Minute, ctl.IsLeader)
 	}
 	if err := a.Run(ctx); err != nil {
 		logger.Fatal(err)

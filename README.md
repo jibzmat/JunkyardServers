@@ -57,6 +57,10 @@ architecture and roadmap.
   (with ranges and conditional headers), head, delete, copy, multi-delete,
   ListObjects v1 and v2, and multipart uploads including part copy. Anything
   else (ACLs, policies, versioning, tagging) answers `NotImplemented`.
+- Repair runs on the control-plane leader. When a storage PC has been
+  unreachable for 15 minutes (`jyd -repair-after`), every chunk it held is
+  rebuilt from any k surviving shards and the missing shards are written to
+  other PCs. Repair works on ciphertext and needs no keys.
 - A chunk is written once k+1 of its shards are stored, so one more PC can
   fail before it is at risk. Reads need any k shards. A PC that fails a write
   is skipped for 30 seconds, so uploads keep working while gossip catches up.
@@ -117,6 +121,7 @@ internal/agent/       jyd main loop
 internal/storage/     object encryption, erasure coding, placement, shard servers
 internal/s3meta/      S3 metadata types (tenants, buckets, objects, uploads)
 internal/s3gw/        S3 gateway: SigV4/SigV2, buckets, objects, multipart
+internal/repair/      rebuilds shards lost with storage PCs
 internal/cluster/     shared types: roles, trust tiers
 internal/hw/          hardware detection
 ```
@@ -131,9 +136,11 @@ go vet ./... && go test -race ./...
 
 M1:
 
-- Repair and scrubbing. Shards on a PC that is gone for good are not yet
-  rebuilt elsewhere, and objects written while PCs were down use the thinner
-  coding that fit the PCs left.
+- Scrubbing and garbage collection: shards are not yet re-read to catch
+  silent corruption, and shards left on a PC that comes back after repair
+  are not cleaned up.
+- Objects written while PCs were down keep the thinner coding that fit the
+  PCs left; repair restores missing shards but doesn't upgrade the coding.
 - Tenant master keys are held whole by every control node; splitting them
   with Shamir's scheme is next.
 - The gateway-side encrypted listing index for large buckets. Listing works

@@ -75,6 +75,14 @@ func (o *Object) Segments() []Segment {
 	return []Segment{{ID: o.ID, Size: o.Size, ETag: o.ETag, WrappedKey: o.WrappedKey, Layout: o.Layout}}
 }
 
+// ShardMove records a shard rebuilt onto another node by repair.
+type ShardMove struct {
+	Chunk int    `json:"chunk"`
+	Index int    `json:"index"` // position in the k+m shard set
+	Hash  string `json:"hash"`
+	Node  string `json:"node"`
+}
+
 // Upload is a multipart upload in progress.
 type Upload struct {
 	ID          string            `json:"id"`

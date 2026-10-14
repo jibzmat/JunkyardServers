@@ -15,6 +15,7 @@ import (
 
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
 	"github.com/jibzmat/JunkyardServers/internal/s3meta"
+	"github.com/jibzmat/JunkyardServers/internal/storage"
 	"github.com/jibzmat/JunkyardServers/internal/token"
 )
 
@@ -96,6 +97,8 @@ const (
 	opPutPart        = "put_part"
 	opCompleteUpload = "complete_upload"
 	opAbortUpload    = "abort_upload"
+
+	opMoveShards = "move_shards"
 )
 
 type command struct {
@@ -120,6 +123,9 @@ type command struct {
 	UploadID string                 `json:"upload_id,omitempty"`
 	Part     *s3meta.Part           `json:"part,omitempty"`
 	Parts    []s3meta.CompletedPart `json:"parts,omitempty"`
+
+	SegmentID string             `json:"segment_id,omitempty"`
+	Moves     []s3meta.ShardMove `json:"moves,omitempty"`
 }
 
 // Errors the state machine can return for a command.
@@ -158,6 +164,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		res, err = f.applyObject(c)
 	case opCreateUpload, opPutPart, opCompleteUpload, opAbortUpload:
 		res, err = f.applyUpload(c)
+	case opMoveShards:
+		err = f.applyMoves(c)
 	default:
 		return f.apply(c)
 	}
@@ -165,6 +173,59 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		return err
 	}
 	return res
+}
+
+// errStale means the object changed since repair read it.
+var errStale = errors.New("control: object changed during repair")
+
+// applyMoves records rebuilt shards. Stored objects are never modified in
+// place (readers hold shallow copies), so the object is copied first.
+func (f *fsm) applyMoves(c command) error {
+	old, ok := f.st.Objects[c.Name][c.Key]
+	if !ok {
+		return errStale
+	}
+	b, err := json.Marshal(old)
+	if err != nil {
+		return err
+	}
+	obj := &s3meta.Object{}
+	if err := json.Unmarshal(b, obj); err != nil {
+		return err
+	}
+	var layout *storage.Layout
+	if len(obj.Parts) == 0 && obj.ID == c.SegmentID {
+		layout = &obj.Layout
+	}
+	for i := range obj.Parts {
+		if obj.Parts[i].ID == c.SegmentID {
+			layout = &obj.Parts[i].Layout
+		}
+	}
+	if layout == nil {
+		return errStale
+	}
+	for _, mv := range c.Moves {
+		if mv.Chunk < 0 || mv.Chunk >= len(layout.Chunks) || mv.Index < 0 || mv.Index >= layout.DataShards+layout.ParityShards {
+			return errStale
+		}
+		ch := &layout.Chunks[mv.Chunk]
+		found := false
+		for j := range ch.Shards {
+			if ch.Shards[j].Index == mv.Index {
+				if ch.Shards[j].Hash != mv.Hash {
+					return errStale
+				}
+				ch.Shards[j].Node = mv.Node
+				found = true
+			}
+		}
+		if !found {
+			ch.Shards = append(ch.Shards, storage.ShardRef{Index: mv.Index, Hash: mv.Hash, Node: mv.Node})
+		}
+	}
+	f.st.Objects[c.Name][c.Key] = obj
+	return nil
 }
 
 // applyUpload handles multipart uploads.

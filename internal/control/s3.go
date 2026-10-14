@@ -370,6 +370,26 @@ func (s *Server) ListUploads(tenant, bucket string) ([]s3meta.Upload, error) {
 	return out, nil
 }
 
+// AllObjects returns every object record, for repair. Records are never
+// modified in place, so the copies may share their layouts.
+func (s *Server) AllObjects() []s3meta.Object {
+	var out []s3meta.Object
+	s.fsm.view(func(st *state) {
+		for _, objs := range st.Objects {
+			for _, o := range objs {
+				out = append(out, *o)
+			}
+		}
+	})
+	return out
+}
+
+// MoveShards records shards that repair rebuilt on other nodes. It fails
+// if the object or segment changed since it was read.
+func (s *Server) MoveShards(bucket, key, segmentID string, moves []s3meta.ShardMove) error {
+	return s.apply(command{Op: opMoveShards, Name: bucket, Key: key, SegmentID: segmentID, Moves: moves})
+}
+
 // --- HTTP ---
 
 func (s *Server) s3Routes(mux *http.ServeMux) {
