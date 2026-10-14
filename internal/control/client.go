@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/jibzmat/JunkyardServers/internal/cluster"
 	"github.com/jibzmat/JunkyardServers/internal/pki"
+	"github.com/jibzmat/JunkyardServers/internal/s3meta"
 	"github.com/jibzmat/JunkyardServers/internal/token"
 )
 
@@ -131,6 +133,99 @@ func (c *Client) RemoveControl(ctx context.Context, id string) error {
 	return c.call(ctx, http.MethodDelete, "/v1/controls/"+id, nil, &out)
 }
 
+// CreateTenant adds an S3 tenant and returns its first access key (admin
+// certificate required).
+func (c *Client) CreateTenant(ctx context.Context, name string) (*s3meta.TenantResponse, error) {
+	var out s3meta.TenantResponse
+	if err := c.call(ctx, http.MethodPost, "/v1/tenants", s3meta.TenantRequest{Name: name}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// S3 metadata calls, for gateways.
+
+// AccessKey looks up an S3 credential.
+func (c *Client) AccessKey(ctx context.Context, id string) (*s3meta.AccessKey, error) {
+	var out s3meta.AccessKey
+	if err := c.call(ctx, http.MethodGet, "/v1/s3/access-keys/"+url.PathEscape(id), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// WrapKey seals a data key with the tenant's master key.
+func (c *Client) WrapKey(ctx context.Context, tenant string, key []byte) ([]byte, error) {
+	var out s3meta.KeyResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/wrap", s3meta.KeyRequest{Tenant: tenant, Key: key}, &out)
+	return out.Key, err
+}
+
+// UnwrapKey opens a wrapped data key.
+func (c *Client) UnwrapKey(ctx context.Context, tenant string, wrapped []byte) ([]byte, error) {
+	var out s3meta.KeyResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/unwrap", s3meta.KeyRequest{Tenant: tenant, Key: wrapped}, &out)
+	return out.Key, err
+}
+
+// ListBuckets lists a tenant's buckets.
+func (c *Client) ListBuckets(ctx context.Context, tenant string) ([]s3meta.Bucket, error) {
+	var out []s3meta.Bucket
+	err := c.call(ctx, http.MethodPost, "/v1/s3/buckets/list", s3meta.BucketRequest{Tenant: tenant}, &out)
+	return out, err
+}
+
+// Bucket returns one bucket.
+func (c *Client) Bucket(ctx context.Context, tenant, name string) (*s3meta.Bucket, error) {
+	var out s3meta.Bucket
+	if err := c.call(ctx, http.MethodPost, "/v1/s3/buckets/get", s3meta.BucketRequest{Tenant: tenant, Bucket: name}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateBucket creates a bucket.
+func (c *Client) CreateBucket(ctx context.Context, tenant, name string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/s3/buckets/create", s3meta.BucketRequest{Tenant: tenant, Bucket: name}, &out)
+}
+
+// DeleteBucket deletes an empty bucket.
+func (c *Client) DeleteBucket(ctx context.Context, tenant, name string) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/s3/buckets/delete", s3meta.BucketRequest{Tenant: tenant, Bucket: name}, &out)
+}
+
+// PutObject records an object and returns the one it replaced, if any.
+func (c *Client) PutObject(ctx context.Context, tenant string, obj s3meta.Object) (*s3meta.Object, error) {
+	var out s3meta.ObjectResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/objects/put", s3meta.PutObjectRequest{Tenant: tenant, Object: obj}, &out)
+	return out.Object, err
+}
+
+// Object returns an object record.
+func (c *Client) Object(ctx context.Context, tenant, bucket, key string) (*s3meta.Object, error) {
+	var out s3meta.ObjectResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/objects/get", s3meta.ObjectRequest{Tenant: tenant, Bucket: bucket, Key: key}, &out)
+	return out.Object, err
+}
+
+// DeleteObject removes an object record and returns it (nil if absent).
+func (c *Client) DeleteObject(ctx context.Context, tenant, bucket, key string) (*s3meta.Object, error) {
+	var out s3meta.ObjectResponse
+	err := c.call(ctx, http.MethodPost, "/v1/s3/objects/delete", s3meta.ObjectRequest{Tenant: tenant, Bucket: bucket, Key: key}, &out)
+	return out.Object, err
+}
+
+// ListObjects is ListObjectsV2.
+func (c *Client) ListObjects(ctx context.Context, req s3meta.ListRequest) (*s3meta.ListResponse, error) {
+	var out s3meta.ListResponse
+	if err := c.call(ctx, http.MethodPost, "/v1/s3/objects/list", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // call tries each address until one answers. A refusal from a reachable
 // control node (4xx) is returned at once; only transport failures and 503s
 // move on to the next address.
@@ -145,7 +240,8 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 			return nil
 		}
 		var he *httpErr
-		if errors.As(err, &he) && he.code != http.StatusServiceUnavailable {
+		var me *s3meta.Error
+		if errors.As(err, &me) || (errors.As(err, &he) && he.code != http.StatusServiceUnavailable) {
 			return err
 		}
 		errs = append(errs, err)
@@ -193,15 +289,19 @@ func do(ctx context.Context, hc *http.Client, method, url string, in, out any) e
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxMetaBodyBytes))
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
 		var e struct {
+			Code  string `json:"code"`
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(data, &e)
+		if e.Code != "" {
+			return &s3meta.Error{Code: e.Code, Msg: e.Error}
+		}
 		return &httpErr{code: resp.StatusCode, msg: e.Error}
 	}
 	return json.Unmarshal(data, out)

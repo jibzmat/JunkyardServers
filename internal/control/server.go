@@ -303,21 +303,28 @@ func (s *Server) waitLeader(timeout time.Duration) error {
 
 // apply commits a command and returns the state machine's verdict.
 func (s *Server) apply(c command) error {
+	_, err := s.applyResult(c)
+	return err
+}
+
+// applyResult commits a command and returns its non-error result.
+func (s *Server) applyResult(c command) (any, error) {
 	b, err := json.Marshal(c)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	f := s.raft.Apply(b, applyTimeout)
 	if err := f.Error(); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
-			return ErrNotLeader
+			return nil, ErrNotLeader
 		}
-		return err
+		return nil, err
 	}
-	if resp, ok := f.Response().(error); ok && resp != nil {
-		return resp
+	resp := f.Response()
+	if err, ok := resp.(error); ok && err != nil {
+		return nil, err
 	}
-	return nil
+	return resp, nil
 }
 
 // leaderBarrier makes sure this node leads and has applied every committed
@@ -360,6 +367,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/controls/enroll", s.requireKind(s.leaderOnly(s.handleControlEnroll), pki.KindNode))
 	mux.HandleFunc("POST /v1/controls/activate", s.requireKind(s.leaderOnly(s.handleControlActivate), pki.KindControl))
 	mux.HandleFunc("DELETE /v1/controls/{id}", s.requireKind(s.leaderOnly(s.handleControlRemove), pki.KindAdmin))
+	s.s3Routes(mux)
 	return mux
 }
 
@@ -872,7 +880,11 @@ func writeJSON0600(path string, v any) error {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(v); err != nil {
+	return decodeLimit(w, r, v, maxBodyBytes)
+}
+
+func decodeLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit)).Decode(v); err != nil {
 		httpError(w, http.StatusBadRequest, "bad request body")
 		return false
 	}
@@ -885,7 +897,11 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func httpError(w http.ResponseWriter, code int, msg string) {
+	writeJSONStatus(w, code, map[string]string{"error": msg})
+}
+
+func writeJSONStatus(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(v)
 }
