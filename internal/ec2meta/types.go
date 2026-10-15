@@ -57,18 +57,24 @@ type InstanceType struct {
 	Name   string `json:"name"`
 	VCPU   int    `json:"vcpu"`
 	MemMiB int    `json:"mem_mib"`
+	// Nodes is how many VMs, each on its own PC, a cluster instance type
+	// runs as one instance (VCPU and MemMiB are each node's); 0 otherwise.
+	Nodes int `json:"nodes,omitempty"`
 }
 
 var instanceTypes = map[string]InstanceType{}
 
 func init() {
 	for _, t := range []InstanceType{
-		{"t3.nano", 2, 512}, {"t3.micro", 2, 1024}, {"t3.small", 2, 2048},
-		{"t3.medium", 2, 4096}, {"t3.large", 2, 8192}, {"t3.xlarge", 4, 16384},
-		{"t3.2xlarge", 8, 32768},
-		{"m5.large", 2, 8192}, {"m5.xlarge", 4, 16384}, {"m5.2xlarge", 8, 32768},
-		{"c5.large", 2, 4096}, {"c5.xlarge", 4, 8192}, {"c5.2xlarge", 8, 16384},
-		{"r5.large", 2, 16384}, {"r5.xlarge", 4, 32768},
+		{"t3.nano", 2, 512, 0}, {"t3.micro", 2, 1024, 0}, {"t3.small", 2, 2048, 0},
+		{"t3.medium", 2, 4096, 0}, {"t3.large", 2, 8192, 0}, {"t3.xlarge", 4, 16384, 0},
+		{"t3.2xlarge", 8, 32768, 0},
+		{"m5.large", 2, 8192, 0}, {"m5.xlarge", 4, 16384, 0}, {"m5.2xlarge", 8, 32768, 0},
+		{"c5.large", 2, 4096, 0}, {"c5.xlarge", 4, 8192, 0}, {"c5.2xlarge", 8, 16384, 0},
+		{"r5.large", 2, 16384, 0}, {"r5.xlarge", 4, 32768, 0},
+		// Cluster instances: N nodes on N PCs.
+		{"jy.cluster.2x", 2, 2048, 2}, {"jy.cluster.4x", 2, 2048, 4}, {"jy.cluster.8x", 2, 2048, 8},
+		{"jy.cluster.2x.large", 4, 8192, 2}, {"jy.cluster.4x.large", 4, 8192, 4}, {"jy.cluster.8x.large", 4, 8192, 8},
 	} {
 		instanceTypes[t.Name] = t
 	}
@@ -148,6 +154,25 @@ type Instance struct {
 	// RebootSeq is bumped by RebootInstances; the host reboots the VM when
 	// it sees a value it hasn't acted on.
 	RebootSeq int `json:"reboot_seq,omitempty"`
+
+	// A cluster instance (a jy.cluster type) is ClusterSize VMs, each on
+	// its own PC, sharing one instance ID: node 0's. The other nodes are
+	// records of their own, never shown to the tenant, with ClusterOf set
+	// to node 0's ID.
+	ClusterOf    string `json:"cluster_of,omitempty"`
+	ClusterIndex int    `json:"cluster_index,omitempty"`
+	ClusterSize  int    `json:"cluster_size,omitempty"`
+	// ClusterIPs are every node's private address, by index.
+	ClusterIPs []string `json:"cluster_ips,omitempty"`
+}
+
+// ClusterID is the instance ID a node belongs to: its own, unless it is
+// a hidden node of a cluster instance.
+func (in *Instance) ClusterID() string {
+	if in.ClusterOf != "" {
+		return in.ClusterOf
+	}
+	return in.ID
 }
 
 // KeyPair is an SSH public key registered under a name.

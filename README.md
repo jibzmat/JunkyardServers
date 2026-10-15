@@ -7,8 +7,9 @@ ciphertext. Strangers' PCs get the same storage and compute features as your
 own; the only difference is encrypted guest RAM, which needs SEV-SNP or TDX.
 
 This repository has finished **M0 (mesh and cluster bootstrap)**, **M1
-(encrypted S3 storage)**, **M3 (VPC networking)** and **M4 (peer
-hardening)**, and has **M2 (EC2)** except SEV-SNP/TDX attestation: the stock
+(encrypted S3 storage)**, **M3 (VPC networking)**, **M4 (peer
+hardening)** and **M5 (scale out)**, and has **M2 (EC2)** except
+SEV-SNP/TDX attestation: the stock
 `aws s3`, `aws s3api` and `aws ec2` commands work against it. See [docs/design.md](docs/design.md) for the
 architecture and roadmap.
 
@@ -163,10 +164,10 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   other than its own.
 - Instances reach the internet through NAT on their PC, but not the mesh,
   other VPCs or the PC's LAN.
-- Instances have no address outside their VPC yet. To log in, run `ssh`
-  inside the VPC's namespace on the PC that runs the instance, as above
-  (`sudo ip netns list` shows them). A tunnel through the gateway and
-  public IPs come with M5.
+- Instances have no address outside their VPC until you give one an
+  elastic IP (M5). Until then, to log in, run `ssh` inside the VPC's
+  namespace on the PC that runs the instance, as above (`sudo ip netns
+  list` shows them).
 
 ## What M4 adds: peer hardening
 
@@ -190,7 +191,7 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   PCs first, so with enough of them every chunk can be read even if all
   strangers' PCs disappear at once.
 
-## What M5 adds so far: live migration, elastic IPs and NAT gateways
+## What M5 adds: live migration, elastic IPs, NAT gateways and cluster instances
 
 - `jyctl migrate <instance-id>` moves a running instance to its second PC
   (the one holding the live copy of its disks) without stopping it: the
@@ -235,7 +236,25 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   before. A table without a default route, or one to a deleted NAT
   gateway (a blackhole), gives its subnets no internet. An instance's
   own elastic IP wins over its subnet's NAT gateway.
-- Still to come in M5: cluster instances.
+- Cluster instances: a `jy.cluster.<N>x` instance type (2, 4 or 8
+  nodes of 2 vCPUs and 2 GiB; `.large` for 4 vCPUs and 8 GiB) runs N
+  VMs on N different PCs as one instance ID, for work that already
+  scales out (build farms, MPI, Spark, Kubernetes nodes):
+
+  ```sh
+  aws ec2 run-instances --instance-type jy.cluster.4x --image-id ami-... --key-name k1
+  ```
+
+  Every node boots the same image, key and user data, in the same
+  subnet and security groups. Each reads which node it is, and every
+  node's address, from the metadata service
+  (`meta-data/jy/cluster/index`, `size` and `ips`); `instance-id` is the
+  cluster's on all of them. `describe-instances` shows the one instance,
+  with every node's address on its network interface (node 0's first),
+  and reports it running only once all nodes are, so `aws ec2 wait`
+  works. Stop, start, reboot, terminate and tags apply to every node;
+  an elastic IP, volumes, the console and `create-image` go to node 0.
+  Launching needs N PCs that can run a node.
 
 ## Try it
 
@@ -321,6 +340,9 @@ M5:
 - An elastic IP or NAT gateway works only while the PC holding its
   address is up, and instances can't reach their own VPC's elastic IPs
   from inside it.
+- A cluster instance's node that fails over, or is moved by a drain,
+  goes to its replica PC even if another node already runs there, when
+  no other PC could keep its copy.
 - Route tables hold only the default route (0.0.0.0/0); traffic inside
   the VPC always stays local. Private NAT gateways, and associating a
   table with a gateway, aren't supported.

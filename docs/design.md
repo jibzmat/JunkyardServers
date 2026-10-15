@@ -170,8 +170,7 @@ instances reach the internet through NAT.
   whose source isn't the instance's (strict reverse-path filtering).
 - The M2 scheme (one routed /24 of 10.128.0.0/9 per PC, all instances in
   one network) is removed. Instances are no longer reachable from the
-  mesh; reaching them from outside the VPC (an Instance Connect Endpoint
-  style tunnel, public IPs) comes with M5.
+  mesh; reaching them from outside the VPC is by elastic IP (M5).
 
 ## Peer hardening (M4)
 
@@ -295,6 +294,20 @@ instances reach the internet through NAT.
   VXLAN to it. Traffic from a subnet with no way out from this PC is
   dropped before the namespace's uplink, so a missing or deleted route
   can't fall back to the PC's own NAT.
+
+- Cluster instances: a `jy.cluster.<N>x` type launches N node records.
+  Node 0 has the instance ID the tenant sees; the others have IDs of
+  their own (so taps, disks and sockets stay distinct), with `ClusterOf`
+  set to it, and are hidden from every tenant API: listing, naming them
+  in an action, tagging. Each node is an ordinary instance to the hosts
+  (its own disk, replica, failover and migration). The scheduler never
+  puts two nodes of one cluster on the same PC, and replica placement
+  avoids PCs holding another node when it can. All nodes carry the
+  cluster's tags and every node's address (`ClusterIPs`, fixed at
+  launch), which the metadata service serves under `jy/cluster/`.
+  Actions on the instance apply to every node as far as each node's
+  state allows, and the tenant sees a settling state (pending, stopping,
+  shutting-down) until all nodes have settled.
 
 ## Roadmap
 

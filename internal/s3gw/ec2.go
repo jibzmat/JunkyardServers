@@ -455,6 +455,36 @@ type instanceXML struct {
 		CoreCount      int `xml:"coreCount"`
 		ThreadsPerCore int `xml:"threadsPerCore"`
 	} `xml:"cpuOptions"`
+	Interfaces []eniXML `xml:"networkInterfaceSet>item"`
+}
+
+// eniXML is an instance's one network interface. A cluster instance's
+// lists every node's address, node 0's as the primary.
+type eniXML struct {
+	ID         string        `xml:"networkInterfaceId"`
+	SubnetID   string        `xml:"subnetId"`
+	VpcID      string        `xml:"vpcId"`
+	OwnerID    string        `xml:"ownerId"`
+	Status     string        `xml:"status"`
+	MAC        string        `xml:"macAddress"`
+	PrivateIP  string        `xml:"privateIpAddress"`
+	PrivateDNS string        `xml:"privateDnsName"`
+	SourceDest bool          `xml:"sourceDestCheck"`
+	Groups     []groupRefXML `xml:"groupSet>item"`
+	Attachment struct {
+		ID     string `xml:"attachmentId"`
+		Index  int    `xml:"deviceIndex"`
+		Status string `xml:"status"`
+		Delete bool   `xml:"deleteOnTermination"`
+	} `xml:"attachment"`
+	Association *struct {
+		PublicIP string `xml:"publicIp"`
+	} `xml:"association,omitempty"`
+	Addresses []struct {
+		IP         string `xml:"privateIpAddress"`
+		PrivateDNS string `xml:"privateDnsName"`
+		Primary    bool   `xml:"primary"`
+	} `xml:"privateIpAddressesSet>item"`
 }
 
 type groupRefXML struct {
@@ -493,6 +523,29 @@ func (g *Gateway) instanceXML(in ec2meta.Instance) instanceXML {
 	x.CPU.CoreCount, x.CPU.ThreadsPerCore = in.VCPU, 1
 	if in.PrivateIP != "" {
 		x.PrivateDNSName = "ip-" + strings.ReplaceAll(in.PrivateIP, ".", "-") + ".jy.internal"
+	}
+	if in.PrivateIP != "" && in.State != ec2meta.StateTerminated {
+		suffix := strings.TrimPrefix(in.ID, "i-")
+		eni := eniXML{ID: "eni-" + suffix, SubnetID: in.SubnetID, VpcID: in.VpcID, OwnerID: ownerID(in.Tenant), Status: "in-use",
+			MAC: in.MAC, PrivateIP: in.PrivateIP, PrivateDNS: x.PrivateDNSName, SourceDest: true, Groups: x.Groups}
+		eni.Attachment.ID, eni.Attachment.Status, eni.Attachment.Delete = "eni-attach-"+suffix, "attached", true
+		if in.PublicIP != "" {
+			eni.Association = &struct {
+				PublicIP string `xml:"publicIp"`
+			}{in.PublicIP}
+		}
+		ips := in.ClusterIPs
+		if len(ips) == 0 {
+			ips = []string{in.PrivateIP}
+		}
+		for i, ip := range ips {
+			eni.Addresses = append(eni.Addresses, struct {
+				IP         string `xml:"privateIpAddress"`
+				PrivateDNS string `xml:"privateDnsName"`
+				Primary    bool   `xml:"primary"`
+			}{ip, "ip-" + strings.ReplaceAll(ip, ".", "-") + ".jy.internal", i == 0})
+		}
+		x.Interfaces = []eniXML{eni}
 	}
 	if in.StateReason != "" {
 		code, _, _ := strings.Cut(in.StateReason, ":")

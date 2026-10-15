@@ -253,7 +253,7 @@ func (m *metadataServer) tree(in ec2meta.Instance) map[string]string {
 		"meta-data/block-device-mapping/ami":                             "/dev/sda1",
 		"meta-data/block-device-mapping/root":                            "/dev/sda1",
 		"meta-data/hostname":                                             hostname(in),
-		"meta-data/instance-id":                                          in.ID,
+		"meta-data/instance-id":                                          in.ClusterID(),
 		"meta-data/instance-life-cycle":                                  "on-demand",
 		"meta-data/instance-type":                                        in.Type,
 		"meta-data/local-hostname":                                       hostname(in),
@@ -280,6 +280,13 @@ func (m *metadataServer) tree(in ec2meta.Instance) map[string]string {
 	if len(in.UserData) > 0 {
 		t["user-data"] = string(in.UserData)
 	}
+	if in.ClusterSize > 1 {
+		// A cluster instance's node: which one it is, and every node's
+		// address (for an MPI host file, a Spark or Kubernetes join).
+		t["meta-data/jy/cluster/index"] = strconv.Itoa(in.ClusterIndex)
+		t["meta-data/jy/cluster/size"] = strconv.Itoa(in.ClusterSize)
+		t["meta-data/jy/cluster/ips"] = strings.Join(in.ClusterIPs, "\n") + "\n"
+	}
 	for k, v := range in.Tags {
 		if k != "" && !strings.ContainsAny(k, "/\n") {
 			t["meta-data/tags/instance/"+k] = v
@@ -290,7 +297,7 @@ func (m *metadataServer) tree(in ec2meta.Instance) map[string]string {
 		"architecture":     "x86_64",
 		"availabilityZone": zone,
 		"imageId":          in.ImageID,
-		"instanceId":       in.ID,
+		"instanceId":       in.ClusterID(),
 		"instanceType":     in.Type,
 		"pendingTime":      in.Launched.UTC().Format(time.RFC3339),
 		"privateIp":        in.PrivateIP,

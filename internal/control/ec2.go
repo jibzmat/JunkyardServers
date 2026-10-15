@@ -208,18 +208,33 @@ func (f *fsm) applyEC2(c command) (any, error) {
 			in.PrivateIP, in.MAC = ip, macFor(in.ID)
 			out = append(out, in)
 		}
+		ips := map[string][]string{}
+		for _, in := range out {
+			if in.ClusterSize > 1 {
+				id := in.ClusterID()
+				if ips[id] == nil {
+					ips[id] = make([]string, in.ClusterSize)
+				}
+				ips[id][in.ClusterIndex] = in.PrivateIP
+			}
+		}
+		var shown []ec2meta.Instance
 		for i := range out {
 			in := out[i]
+			in.ClusterIPs = ips[in.ClusterID()]
 			e.Instances[in.ID] = &in
+			if in.ClusterOf == "" {
+				shown = append(shown, in)
+			}
 		}
-		return out, nil
+		return shown, nil
 
 	case opInstanceAction:
 		var resp ec2meta.ChangeResponse
 		next := map[string]*ec2meta.Instance{}
 		for _, id := range x.IDs {
 			in, ok := e.Instances[id]
-			if !ok || in.Tenant != c.Owner {
+			if !ok || in.Tenant != c.Owner || in.ClusterOf != "" {
 				return nil, errCode(ec2meta.CodeInvalidInstanceID, "the instance ID '%s' does not exist", id)
 			}
 			n := *in
@@ -228,6 +243,16 @@ func (f *fsm) applyEC2(c command) (any, error) {
 			}
 			next[id] = &n
 			resp.Changes = append(resp.Changes, ec2meta.StateChange{ID: id, Previous: in.State, Current: n.State})
+		}
+		// A cluster instance's other nodes follow node 0, each as far as
+		// its own state allows.
+		for _, in := range e.Instances {
+			if in.ClusterOf != "" && next[in.ClusterOf] != nil {
+				n := *in
+				if instanceAction(&n, x.Action, c.Now) == nil {
+					next[n.ID] = &n
+				}
+			}
 		}
 		for id, n := range next {
 			e.Instances[id] = n
@@ -434,7 +459,7 @@ func hasResource(e *ec2State, tenant, id string) bool {
 	switch {
 	case strings.HasPrefix(id, "i-"):
 		in, ok := e.Instances[id]
-		return ok && in.Tenant == tenant
+		return ok && in.Tenant == tenant && in.ClusterOf == ""
 	case strings.HasPrefix(id, "ami-"):
 		img, ok := e.Images[id]
 		return ok && img.Tenant == tenant
@@ -496,9 +521,14 @@ func mergeTags(old, add map[string]string, del bool) map[string]string {
 func setTags(e *ec2State, tenant, id string, tags map[string]string, del bool) {
 	switch {
 	case strings.HasPrefix(id, "i-"):
-		n := *e.Instances[id]
-		n.Tags = mergeTags(n.Tags, tags, del)
-		e.Instances[id] = &n
+		// A cluster instance's nodes all carry its tags (for metadata).
+		for nid, in := range e.Instances {
+			if nid == id || in.ClusterOf == id {
+				n := *in
+				n.Tags = mergeTags(n.Tags, tags, del)
+				e.Instances[nid] = &n
+			}
+		}
 	case strings.HasPrefix(id, "ami-"):
 		n := *e.Images[id]
 		n.Tags = mergeTags(n.Tags, tags, del)
@@ -612,7 +642,7 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 		}
 		if t.ClientToken != "" {
 			for _, in := range st.EC2.Instances {
-				if in.Tenant == tenant && in.ClientToken == t.ClientToken {
+				if in.Tenant == tenant && in.ClientToken == t.ClientToken && in.ClusterOf == "" {
 					existing = append(existing, *in)
 				}
 			}
@@ -640,8 +670,10 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 			err = errCode("SecurityGroupsPerInstanceLimitExceeded", "at most 5 security groups per instance")
 			return
 		}
-		if !s.anyHostCouldRun(st, t) {
+		if n := s.hostsThatCouldRun(st, t); n == 0 {
 			err = errCode(ec2meta.CodeInsufficientCap, "no compute host can run a %s instance with placement %s", t.Type, t.Placement)
+		} else if n < typ.Nodes {
+			err = errCode(ec2meta.CodeInsufficientCap, "a %s instance needs %d PCs that can run its nodes (placement %s); there are %d", t.Type, typ.Nodes, t.Placement, n)
 		}
 	})
 	if err != nil {
@@ -664,7 +696,17 @@ func (s *Server) RunInstances(tenant string, req ec2meta.RunRequest) (*ec2meta.R
 		}
 		in.ReservationID, in.LaunchIndex, in.Launched = res, i, now
 		in.Host, in.PrivateIP, in.MAC, in.RebootSeq = "", "", "", 0
+		in.ClusterOf, in.ClusterIndex, in.ClusterSize, in.ClusterIPs = "", 0, typ.Nodes, nil
 		ins = append(ins, in)
+		// A cluster instance's other nodes.
+		for k := 1; k < typ.Nodes; k++ {
+			node := in
+			if node.ID, err = randString("i-", hexDigits, 17); err != nil {
+				return nil, err
+			}
+			node.ClusterOf, node.ClusterIndex = in.ID, k
+			ins = append(ins, node)
+		}
 	}
 	out, err := s.ec2Apply(opRunInstances, tenant, ec2Command{Instances: ins})
 	if err != nil {
@@ -686,17 +728,17 @@ func (s *Server) Instances(req ec2meta.InstancesRequest) ([]ec2meta.Instance, er
 		if len(req.IDs) > 0 {
 			for _, id := range req.IDs {
 				in, ok := st.EC2.Instances[id]
-				if !ok || in.Tenant != req.Tenant {
+				if !ok || in.Tenant != req.Tenant || in.ClusterOf != "" {
 					err = errCode(ec2meta.CodeInvalidInstanceID, "the instance ID '%s' does not exist", id)
 					return
 				}
-				out = append(out, *in)
+				out = append(out, clusterView(st, *in))
 			}
 			return
 		}
 		for _, in := range st.EC2.Instances {
-			if in.Tenant == req.Tenant {
-				out = append(out, *in)
+			if in.Tenant == req.Tenant && in.ClusterOf == "" {
+				out = append(out, clusterView(st, *in))
 			}
 		}
 	})
@@ -713,6 +755,27 @@ func (s *Server) Instances(req ec2meta.InstancesRequest) ([]ec2meta.Instance, er
 		return out[i].LaunchIndex < out[j].LaunchIndex
 	})
 	return out, nil
+}
+
+// clusterView is how a tenant sees a cluster instance: pending until
+// every node has started, stopping until every node has stopped, and so
+// on, so the CLI's waiters wait for all of them.
+func clusterView(st *state, in ec2meta.Instance) ec2meta.Instance {
+	settling := map[string]string{
+		ec2meta.StateRunning:    ec2meta.StatePending,
+		ec2meta.StateStopped:    ec2meta.StateStopping,
+		ec2meta.StateTerminated: ec2meta.StateShuttingDown,
+	}[in.State]
+	if in.ClusterSize < 2 || settling == "" {
+		return in
+	}
+	for _, n := range st.EC2.Instances {
+		if n.ClusterOf == in.ID && n.State == settling {
+			in.State = settling
+			break
+		}
+	}
+	return in
 }
 
 // InstanceAction stops, starts, reboots or terminates instances.
@@ -915,14 +978,32 @@ func usesHost(in *ec2meta.Instance) bool {
 	return in.Host != "" && in.State != ec2meta.StateStopped && in.State != ec2meta.StateTerminated
 }
 
-func (s *Server) anyHostCouldRun(st *state, in ec2meta.Instance) bool {
+// hostsThatCouldRun counts the PCs big enough for in, ignoring load.
+func (s *Server) hostsThatCouldRun(st *state, in ec2meta.Instance) int {
 	emulate := s.computeOpts().AllowEmulation
+	n := 0
 	for _, m := range st.Members {
 		if v, mem := capacity(m); s.eligible(m, in, emulate) && v >= in.VCPU && mem >= in.MemMiB {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
+}
+
+// clusterHosts maps each cluster instance to the PCs its nodes hold, so
+// no two nodes share one.
+func clusterHosts(st *state) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for _, in := range st.EC2.Instances {
+		if in.ClusterSize > 1 && usesHost(in) {
+			id := in.ClusterID()
+			if out[id] == nil {
+				out[id] = map[string]bool{}
+			}
+			out[id][in.Host] = true
+		}
+	}
+	return out
 }
 
 // schedule places pending instances, gives up on hosts that vanished and
@@ -962,10 +1043,12 @@ func (s *Server) schedule() error {
 			}
 		}
 		sort.Slice(pending, func(i, j int) bool { return pending[i].Launched.Before(pending[j].Launched) })
+		siblings := clusterHosts(st)
 		for _, in := range pending {
 			best, bestLoad := "", 2.0
+			cid := in.ClusterID()
 			for id, m := range st.Members {
-				if !s.eligible(m, *in, opts.AllowEmulation) || !isAlive(id) {
+				if !s.eligible(m, *in, opts.AllowEmulation) || !isAlive(id) || siblings[cid][id] {
 					continue
 				}
 				cpu, mem := capacity(m)
@@ -982,6 +1065,12 @@ func (s *Server) schedule() error {
 			}
 			usedCPU[best] += in.VCPU
 			usedMem[best] += in.MemMiB
+			if in.ClusterSize > 1 {
+				if siblings[cid] == nil {
+					siblings[cid] = map[string]bool{}
+				}
+				siblings[cid][best] = true
+			}
 			assigns = append(assigns, assignment{in.ID, best})
 		}
 	})

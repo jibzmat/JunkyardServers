@@ -172,6 +172,7 @@ func (s *Server) scheduleReplicas(alive map[string]bool, now time.Time) error {
 				usedMem[in.Host] += in.MemMiB
 			}
 		}
+		siblings := clusterHosts(st)
 		ids := make([]string, 0, len(st.EC2.Instances))
 		for id := range st.EC2.Instances {
 			ids = append(ids, id)
@@ -201,8 +202,10 @@ func (s *Server) scheduleReplicas(alive map[string]bool, now time.Time) error {
 					continue
 				}
 			}
-			// Pick the least-loaded other host that could take it over.
-			best, bestLoad := "", 2.0
+			// Pick the least-loaded other host that could take it over,
+			// preferring one without another node of the same cluster
+			// instance (which would share it after a failover).
+			best, bestLoad := "", 3.0
 			for mid, m := range st.Members {
 				if mid == in.Host || !isAlive(mid) || !s.eligible(m, *in, opts.AllowEmulation) {
 					continue
@@ -212,6 +215,9 @@ func (s *Server) scheduleReplicas(alive map[string]bool, now time.Time) error {
 					continue
 				}
 				load := float64(usedMem[mid]+in.MemMiB) / float64(mem)
+				if siblings[in.ClusterID()][mid] {
+					load++
+				}
 				if load < bestLoad || (load == bestLoad && mid < best) {
 					best, bestLoad = mid, load
 				}
