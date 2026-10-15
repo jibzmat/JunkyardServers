@@ -273,6 +273,10 @@ func (m *metadataServer) tree(in ec2meta.Instance) map[string]string {
 		t["meta-data/public-keys/"] = "0=" + in.KeyName // listed as EC2 lists it
 		t["meta-data/public-keys/0/openssh-key"] = in.PublicKey + "\n"
 	}
+	if in.PublicIP != "" {
+		t["meta-data/public-ipv4"] = in.PublicIP
+		t["meta-data/network/interfaces/macs/"+in.MAC+"/public-ipv4s"] = in.PublicIP
+	}
 	if len(in.UserData) > 0 {
 		t["user-data"] = string(in.UserData)
 	}

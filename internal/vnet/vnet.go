@@ -151,6 +151,9 @@ func (m *Manager) Sync(ctx context.Context, node, meshIP string, nets []ec2meta.
 	if err := m.syncVXLANFilter(ctx, node, nets); err != nil {
 		errs = append(errs, err)
 	}
+	if err := m.syncPublic(ctx, node, nets); err != nil {
+		errs = append(errs, err)
+	}
 	// Namespaces of VPCs with no instances here any more.
 	entries, _ := os.ReadDir("/run/netns")
 	for _, e := range entries {
@@ -338,6 +341,9 @@ func (m *Manager) syncVPC(ctx context.Context, node, meshIP string, n ec2meta.VP
 		errs = append(errs, err)
 	}
 	if err := m.syncRemote(ctx, ns, node, meshIP, n); err != nil {
+		errs = append(errs, err)
+	}
+	if err := m.syncEIPRoutes(ctx, ns, node, meshIP, n); err != nil {
 		errs = append(errs, err)
 	}
 	for _, ep := range n.Endpoints {
@@ -618,6 +624,12 @@ func (m *Manager) syncVXLANFilter(ctx context.Context, node string, nets []ec2me
 			if ep.Host != node && ep.HostIP != "" && !seen[ep.HostIP] {
 				seen[ep.HostIP] = true
 				allow = append(allow, pair{ep.HostIP, n.VPC.VNI})
+			}
+		}
+		for _, e := range n.EIPs {
+			if e.Gateway != node && e.GatewayIP != "" && !seen[e.GatewayIP] {
+				seen[e.GatewayIP] = true
+				allow = append(allow, pair{e.GatewayIP, n.VPC.VNI})
 			}
 		}
 	}

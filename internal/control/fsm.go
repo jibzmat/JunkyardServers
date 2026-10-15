@@ -196,8 +196,12 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		opCreateVPC, opDeleteVPC, opCreateSubnet, opDeleteSubnet, opCreateGroup, opDeleteGroup, opGroupRules, opDefaultVPC,
 		opCreateVolume, opDeleteVolume, opAttachVolume, opDetachVolume, opVolumeReport,
 		opCreateSnapshot, opDeleteSnapshot, opCreateImage, opTaskDone, opTaskFailed,
-		opSetReplica, opReplicaReport, opFailover, opMoveVolume, opMigrate, opMigrated, opDrain:
+		opSetReplica, opReplicaReport, opFailover, opMoveVolume, opMigrate, opMigrated, opDrain,
+		opAllocateAddress, opReleaseAddress, opAssociateAddress, opDisassociateAddress, opPool:
 		res, err = f.applyEC2(c)
+		if err == nil {
+			f.tidyAddresses()
+		}
 	default:
 		return f.apply(c)
 	}

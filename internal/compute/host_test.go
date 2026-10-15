@@ -1001,6 +1001,24 @@ func testLiveMigration(t *testing.T, fail bool) {
 	if err != nil || string(got) != string(want) {
 		t.Fatalf("node-b runs it on %q, %v; want the copy %q", got, err, want)
 	}
+	if _, err := os.Stat(filepath.Join(a.instanceDir(id), "disk.qcow2")); !os.IsNotExist(err) {
+		t.Fatalf("node-a kept its out-of-date disk: %v", err)
+	}
+	// The old host's mirrors may reconnect before it stops; node-b must
+	// not start a fresh (blank) copy of a disk it now runs.
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(c, `{"disk":"`+id+`","size":10}`+"\n")
+	line, _ := io.ReadAll(c)
+	c.Close()
+	if !strings.Contains(string(line), "no copy") {
+		t.Fatalf("a stale mirror was answered %q", line)
+	}
+	if _, err := os.Stat(b.replicaPath(id)); !os.IsNotExist(err) {
+		t.Fatalf("node-b made a copy of its own disk: %v", err)
+	}
 	// The control plane moves it; node-b keeps it running.
 	moved := moving
 	moved.Host, moved.Replica, moved.MigrateTo = "node-b", "", ""

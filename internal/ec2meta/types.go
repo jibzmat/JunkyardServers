@@ -126,6 +126,8 @@ type Instance struct {
 	SecurityGroups []string `json:"security_groups,omitempty"`
 	PrivateIP      string   `json:"private_ip,omitempty"`
 	MAC            string   `json:"mac,omitempty"`
+	// PublicIP is the elastic IP associated with it, if any.
+	PublicIP string `json:"public_ip,omitempty"`
 
 	// Host is the PC running it, set by the scheduler.
 	Host string `json:"host,omitempty"` // node ID

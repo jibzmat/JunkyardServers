@@ -117,9 +117,15 @@ func (h *Host) migrate(ctx context.Context, vm *VM) {
 		h.mu.Unlock()
 	} else {
 		h.logf("compute: migrated %s to %s in %v", in.ID, in.MigrateTo, time.Since(start).Round(time.Millisecond))
-		// The guest runs there now; this copy of it stays paused for good.
+		// The guest runs there now; this copy of it stays paused for good,
+		// and its disks are out of date from here on.
 		if err := h.Driver.Stop(ctx, vm, false); err != nil {
 			h.logf("compute: stopping the old copy of %s: %v", in.ID, err)
+		} else {
+			os.Remove(filepath.Join(vm.Dir, "disk.qcow2"))
+			for vol := range ports {
+				os.Remove(h.volumePath(vol))
+			}
 		}
 		if h.Net != nil {
 			h.Net.Unplug(vnet.TapName(in.ID))
@@ -378,6 +384,18 @@ func (h *Host) receiveVM(c net.Conn, br *bufio.Reader, node string, hello replic
 		refuse("%s", firstLine(err.Error()))
 		return
 	}
+	// The disks are this PC's own now. The old host's paused copy still
+	// has mirrors that reconnect until it stops; they must not get a
+	// fresh copy made here (it would be blank, and taken for the disk).
+	h.mu.Lock()
+	if h.arrived == nil {
+		h.arrived = map[string]string{}
+	}
+	for _, d := range disks {
+		h.arrived[d] = node
+		delete(h.replicaFor, d)
+	}
+	h.mu.Unlock()
 	if h.Net != nil {
 		if err := h.Net.Plug(ctx, vm.Instance.VpcID, vnet.TapName(id), vm.Instance.PrivateIP); err != nil {
 			h.logf("compute: routing %s: %v", id, err)

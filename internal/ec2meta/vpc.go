@@ -137,6 +137,19 @@ type VPCNet struct {
 	Endpoints []Endpoint          `json:"endpoints"` // every placed instance of the VPC
 	Groups    []SecurityGroup     `json:"groups"`    // groups of this host's instances
 	Members   map[string][]string `json:"members"`   // group ID -> addresses, for groups rules name
+	// EIPs are the VPC's elastic IPs in use.
+	EIPs []ElasticIP `json:"eips,omitempty"`
+}
+
+// ElasticIP is a public address in use, as the PCs route it: the gateway
+// PC receives traffic for PublicIP and sends it on to the instance at
+// PrivateIP, whose traffic to the internet leaves through the gateway.
+type ElasticIP struct {
+	PublicIP  string `json:"public_ip"`
+	PrivateIP string `json:"private_ip"`
+	Instance  string `json:"instance"`
+	Gateway   string `json:"gateway"`    // node ID
+	GatewayIP string `json:"gateway_ip"` // its mesh address
 }
 
 // Endpoint is an instance's address and the PC it runs on.
@@ -201,4 +214,53 @@ const (
 	CodePermissionNotFound = "InvalidPermission.NotFound"
 	CodeNoFreeAddresses    = "InsufficientFreeAddressesInSubnet"
 	CodeCannotDelete       = "CannotDelete"
+	CodeAllocationNotFound = "InvalidAllocationID.NotFound"
+	CodeAssocNotFound      = "InvalidAssociationID.NotFound"
+	CodeAddressNotFound    = "InvalidAddress.NotFound"
+	CodeAddressLimit       = "AddressLimitExceeded"
+	CodeAlreadyAssociated  = "Resource.AlreadyAssociated"
+	CodeAddressInUse       = "InvalidIPAddress.InUse"
 )
+
+// Elastic IPs (M5).
+
+// PublicIP is an address in the cluster's pool: one that reaches Node, a
+// PC that can take traffic for it (an extra address its provider routes
+// to it, or one on its LAN it may answer for).
+type PublicIP struct {
+	IP   string `json:"ip"`
+	Node string `json:"node"`
+}
+
+// Address is an elastic IP allocated to a tenant, and what it is
+// associated with.
+type Address struct {
+	AllocationID string            `json:"allocation_id"`
+	PublicIP     string            `json:"public_ip"`
+	Tenant       string            `json:"tenant"`
+	Tags         map[string]string `json:"tags,omitempty"`
+	Created      time.Time         `json:"created"`
+
+	AssociationID string `json:"association_id,omitempty"`
+	Instance      string `json:"instance,omitempty"`
+	PrivateIP     string `json:"private_ip,omitempty"`
+}
+
+// AddressRequest allocates, finds, associates or releases addresses.
+type AddressRequest struct {
+	Tenant        string   `json:"tenant"`
+	AllocationIDs []string `json:"allocation_ids,omitempty"`
+	PublicIPs     []string `json:"public_ips,omitempty"`
+	AssociationID string   `json:"association_id,omitempty"`
+	Instance      string   `json:"instance,omitempty"`
+	// Reassociate moves an address already associated elsewhere.
+	Reassociate bool              `json:"reassociate,omitempty"`
+	Tags        map[string]string `json:"tags,omitempty"`
+}
+
+// PoolRequest changes the pool of public addresses (admin).
+type PoolRequest struct {
+	Node   string   `json:"node,omitempty"`
+	IPs    []string `json:"ips"`
+	Remove bool     `json:"remove,omitempty"`
+}

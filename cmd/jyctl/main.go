@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -42,6 +43,8 @@ Commands:
   drain     move every instance off a PC, live, and give it no new ones (drain <node>)
   undrain   let a drained PC take instances again (undrain <node>)
   reinstate lift a node's suspension for failed storage audits (reinstate <node>)
+  public-ip list the public addresses tenants can allocate as elastic IPs, or change them
+            (public-ip add <node> <ip>... | public-ip list | public-ip remove <ip>...)
 
 Run "jyctl <command> -h" for flags.
 `
@@ -67,6 +70,8 @@ func main() {
 		err = cmdWGConfig(os.Args[2:])
 	case "tenant":
 		err = cmdTenant(os.Args[2:])
+	case "public-ip":
+		err = cmdPublicIP(os.Args[2:])
 	case "migrate":
 		err = cmdMigrate(os.Args[2:])
 	case "drain", "undrain", "reinstate":
@@ -406,6 +411,58 @@ func cmdTenant(args []string) error {
 	fmt.Println("Use them with any S3 client pointed at a gateway, for example:")
 	fmt.Println("  aws --endpoint-url http://<gateway>:9000 s3 ls")
 	return nil
+}
+
+func cmdPublicIP(args []string) error {
+	const use = "public-ip: usage: jyctl public-ip add [-dir DIR] <node> <ip>... | list [-dir DIR] | remove [-dir DIR] <ip>..."
+	if len(args) < 1 {
+		return errors.New(use)
+	}
+	fs := flag.NewFlagSet("public-ip "+args[0], flag.ExitOnError)
+	dir := fs.String("dir", defaultDir(), "state directory with admin.crt")
+	fs.Parse(args[1:])
+	c, err := adminClient(*dir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	switch args[0] {
+	case "add":
+		if fs.NArg() < 2 {
+			return errors.New(use)
+		}
+		if err := c.Pool(ctx, ec2meta.PoolRequest{Node: fs.Arg(0), IPs: fs.Args()[1:]}); err != nil {
+			return err
+		}
+		fmt.Printf("%s can now take traffic for %s as elastic IPs.\n", fs.Arg(0), strings.Join(fs.Args()[1:], ", "))
+		fmt.Println("They must reach that PC: extra addresses its provider routes to it, or spare ones on its LAN.")
+		return nil
+	case "remove":
+		if fs.NArg() < 1 {
+			return errors.New(use)
+		}
+		return c.Pool(ctx, ec2meta.PoolRequest{IPs: fs.Args(), Remove: true})
+	case "list":
+		list, err := c.PublicIPs(ctx)
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "ADDRESS\tPC\tTENANT\tALLOCATION\tINSTANCE")
+		for _, p := range list {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", p.IP, p.Node, dash(p.Tenant), dash(p.AllocationID), dash(p.Instance))
+		}
+		return tw.Flush()
+	}
+	return errors.New(use)
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func cmdMigrate(args []string) error {

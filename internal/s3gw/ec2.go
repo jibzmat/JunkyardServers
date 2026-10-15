@@ -63,6 +63,12 @@ type EC2Meta interface {
 	DeleteGroup(ctx context.Context, tenant, id string) error
 	Groups(ctx context.Context, req ec2meta.GroupRequest) ([]ec2meta.SecurityGroup, error)
 	GroupRules(ctx context.Context, req ec2meta.RulesRequest) (*ec2meta.SecurityGroup, error)
+
+	AllocateAddress(ctx context.Context, req ec2meta.AddressRequest) (*ec2meta.Address, error)
+	ReleaseAddress(ctx context.Context, req ec2meta.AddressRequest) error
+	AssociateAddress(ctx context.Context, req ec2meta.AddressRequest) (*ec2meta.Address, error)
+	DisassociateAddress(ctx context.Context, req ec2meta.AddressRequest) error
+	Addresses(ctx context.Context, req ec2meta.AddressRequest) ([]ec2meta.Address, error)
 }
 
 const ec2NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
@@ -278,6 +284,16 @@ func (g *Gateway) serveEC2(q *request) error {
 		return g.groupRules(q, p, false, true, "RevokeSecurityGroupIngressResponse")
 	case "RevokeSecurityGroupEgress":
 		return g.groupRules(q, p, true, true, "RevokeSecurityGroupEgressResponse")
+	case "AllocateAddress":
+		return g.allocateAddress(q, p)
+	case "AssociateAddress":
+		return g.associateAddress(q, p)
+	case "DisassociateAddress":
+		return g.disassociateAddress(q, p)
+	case "ReleaseAddress":
+		return g.releaseAddress(q, p)
+	case "DescribeAddresses":
+		return g.describeAddresses(q, p)
 	case "GetConsoleOutput":
 		c, err := g.EC2.Console(q.ctx, q.tenant, p.Get("InstanceId"))
 		if err != nil {
@@ -387,6 +403,7 @@ type instanceXML struct {
 		State string `xml:"state"`
 	} `xml:"monitoring"`
 	PrivateIP          string           `xml:"privateIpAddress,omitempty"`
+	PublicIP           string           `xml:"ipAddress,omitempty"`
 	SubnetID           string           `xml:"subnetId,omitempty"`
 	VpcID              string           `xml:"vpcId,omitempty"`
 	Groups             []groupRefXML    `xml:"groupSet>item"`
@@ -432,7 +449,7 @@ func (g *Gateway) instanceXML(in ec2meta.Instance) instanceXML {
 		KeyName: in.KeyName, LaunchIndex: in.LaunchIndex, InstanceType: in.Type, LaunchTime: iso(in.Launched),
 		PrivateIP: in.PrivateIP, Architecture: "x86_64", RootDeviceType: "instance-store", RootDeviceName: "/dev/vda",
 		VirtualizationType: "hvm", Hypervisor: "kvm", ClientToken: in.ClientToken, Tags: tagSet(in.Tags),
-		SubnetID: in.SubnetID, VpcID: in.VpcID, SourceDestCheck: true,
+		SubnetID: in.SubnetID, VpcID: in.VpcID, SourceDestCheck: true, PublicIP: in.PublicIP,
 	}
 	for _, id := range in.SecurityGroups {
 		x.Groups = append(x.Groups, groupRefXML{ID: id})
@@ -605,6 +622,8 @@ func matchInstance(in ec2meta.Instance, filters map[string][]string) bool {
 			got = []string{in.KeyName}
 		case name == "private-ip-address":
 			got = []string{in.PrivateIP}
+		case name == "ip-address":
+			got = []string{in.PublicIP}
 		case name == "reservation-id":
 			got = []string{in.ReservationID}
 		case name == "vpc-id":

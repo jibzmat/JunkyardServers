@@ -190,7 +190,7 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   PCs first, so with enough of them every chunk can be read even if all
   strangers' PCs disappear at once.
 
-## What M5 adds so far: live migration
+## What M5 adds so far: live migration and elastic IPs
 
 - `jyctl migrate <instance-id>` moves a running instance to its second PC
   (the one holding the live copy of its disks) without stopping it: the
@@ -202,7 +202,23 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   `jyctl undrain <node>` undoes it.
 - The two PCs need compatible CPUs (guests run with the host's CPU
   model).
-- Still to come in M5: cluster instances, a NAT gateway and elastic IPs.
+- Elastic IPs: list the public addresses your PCs can take traffic for
+  (`jyctl public-ip add <node> <ip>...`: extra addresses a provider
+  routes to a PC, such as a VPS's additional IPs, or spare ones on its
+  LAN). Tenants then use them as on AWS:
+
+  ```sh
+  aws ec2 allocate-address
+  aws ec2 associate-address --allocation-id eipalloc-... --instance-id i-...
+  ssh ubuntu@<the public address>
+  ```
+
+  The instance can run on any PC: the PC holding the address passes its
+  traffic both ways over the VPC, and the instance's own traffic to the
+  internet leaves from the address too. `DescribeInstances` and the
+  metadata service show it. Terminating the instance frees the address;
+  `release-address` returns it to the pool.
+- Still to come in M5: cluster instances and a NAT gateway.
 
 ## Try it
 
@@ -275,7 +291,6 @@ M2:
 - A volume on a PC that never comes back, without a copy in step, can't
   be deleted yet.
 - SEV-SNP/TDX attestation, so `confidential` placement has no hosts yet.
-- Public IPs and a way in from outside the VPC (M5).
 - Spot, launch templates, IAM instance profiles (the metadata service has
   no credentials to hand out yet).
 
@@ -284,6 +299,10 @@ M5:
 - A migration that can't finish (a guest dirtying memory faster than the
   network carries it, even slowed down) gives up after 30 minutes.
 - The console output from before a migration stays on the old PC.
+- Right after a migration, other PCs can't reach the instance for a few
+  seconds, until they see where it went.
+- An elastic IP works only while the PC holding it is up, and instances
+  can't reach their own VPC's elastic IPs from inside it.
 
 M4:
 

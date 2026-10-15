@@ -74,6 +74,8 @@ type ec2Command struct {
 	Target        string                   `json:"target,omitempty"`
 	ReplicaReport *ec2meta.ReplicaReport   `json:"replica_report,omitempty"`
 	Migration     *ec2meta.MigrationReport `json:"migration,omitempty"`
+	Address       *ec2meta.Address         `json:"address,omitempty"`
+	Pool          *ec2meta.PoolRequest     `json:"pool,omitempty"`
 }
 
 // ec2State is the EC2 part of the replicated state.
@@ -87,6 +89,10 @@ type ec2State struct {
 	VPCs      map[string]*ec2meta.VPC           `json:"vpcs"`
 	Subnets   map[string]*ec2meta.Subnet        `json:"subnets"`
 	Groups    map[string]*ec2meta.SecurityGroup `json:"groups"`
+	// Addresses are elastic IPs by allocation ID; PublicIPs is the pool
+	// they come from, by address.
+	Addresses map[string]*ec2meta.Address  `json:"addresses"`
+	PublicIPs map[string]*ec2meta.PublicIP `json:"public_ips"`
 	// NextVNI is the next VXLAN identifier to give a VPC.
 	NextVNI uint32 `json:"next_vni"`
 }
@@ -94,6 +100,12 @@ type ec2State struct {
 func (e *ec2State) fill() {
 	if e.Instances == nil {
 		e.Instances = map[string]*ec2meta.Instance{}
+	}
+	if e.Addresses == nil {
+		e.Addresses = map[string]*ec2meta.Address{}
+	}
+	if e.PublicIPs == nil {
+		e.PublicIPs = map[string]*ec2meta.PublicIP{}
 	}
 	if e.KeyPairs == nil {
 		e.KeyPairs = map[string]*ec2meta.KeyPair{}
@@ -140,6 +152,9 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		return res, err
 	}
 	if res, ok, err := f.applyMigration(c); ok {
+		return res, err
+	}
+	if res, ok, err := f.applyAddress(c); ok {
 		return res, err
 	}
 	switch c.Op {
@@ -431,6 +446,9 @@ func hasResource(e *ec2State, tenant, id string) bool {
 	case strings.HasPrefix(id, "sg-"):
 		v, ok := e.Groups[id]
 		return ok && v.Tenant == tenant
+	case strings.HasPrefix(id, "eipalloc-"):
+		v, ok := e.Addresses[id]
+		return ok && v.Tenant == tenant
 	}
 	return false
 }
@@ -486,6 +504,10 @@ func setTags(e *ec2State, tenant, id string, tags map[string]string, del bool) {
 		n := *e.Groups[id]
 		n.Tags = mergeTags(n.Tags, tags, del)
 		e.Groups[id] = &n
+	case strings.HasPrefix(id, "eipalloc-"):
+		n := *e.Addresses[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.Addresses[id] = &n
 	case strings.HasPrefix(id, "key-"):
 		for name, k := range e.KeyPairs {
 			if k.ID == id && k.Tenant == tenant {
@@ -981,6 +1003,9 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 					vpcs[in.VpcID] = true
 				}
 			}
+		}
+		for _, id := range gatewayVPCs(st, host) {
+			vpcs[id] = true // it passes traffic for an elastic IP there
 		}
 		for _, in := range st.EC2.Instances {
 			// A running instance migrating here: the host gets ready to

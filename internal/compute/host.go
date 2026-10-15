@@ -161,6 +161,7 @@ type Host struct {
 	migrating     map[string]string    // disk -> the incoming VM's NBD socket
 	migrateFailed map[string]time.Time // instance -> last failed migration
 	migrateWait   map[string]time.Time // instance -> since when its target is not ready
+	arrived       map[string]string    // disk migrated here -> its old host, until the view catches up
 }
 
 // retryAfter is how long a failed start waits before the next try.

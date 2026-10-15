@@ -423,6 +423,13 @@ func (h *Host) syncReplicas(ctx context.Context, v *ec2meta.HostView) {
 		owned[vol.ID] = true
 	}
 	h.mu.Lock()
+	for disk, old := range h.arrived {
+		if allowed[disk] == old {
+			delete(allowed, disk) // the view still has it as a copy for its old host
+		} else {
+			delete(h.arrived, disk)
+		}
+	}
 	h.replicaFor = allowed
 	h.mu.Unlock()
 

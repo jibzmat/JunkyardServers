@@ -387,6 +387,7 @@ func vpcNet(st *state, id, host string) (ec2meta.VPCNet, bool) {
 		sort.Strings(ips)
 		n.Members[r] = ips
 	}
+	n.EIPs = vpcEIPs(st, id)
 	sort.Slice(n.Subnets, func(i, j int) bool { return n.Subnets[i].ID < n.Subnets[j].ID })
 	sort.Slice(n.Endpoints, func(i, j int) bool { return n.Endpoints[i].Instance < n.Endpoints[j].Instance })
 	sort.Slice(n.Groups, func(i, j int) bool { return n.Groups[i].ID < n.Groups[j].ID })

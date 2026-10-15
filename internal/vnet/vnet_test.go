@@ -84,3 +84,30 @@ func TestTransitAndMAC(t *testing.T) {
 		t.Fatal(m)
 	}
 }
+
+func TestEIPRules(t *testing.T) {
+	n := testNet()
+	n.EIPs = []ec2meta.ElasticIP{
+		{PublicIP: "203.0.113.10", PrivateIP: "10.0.0.5", Instance: "i-0000000000000000b", Gateway: "n1", GatewayIP: "100.64.0.1"},
+		{PublicIP: "203.0.113.11", PrivateIP: "10.0.0.4", Instance: "i-0000000000000000a", Gateway: "n3", GatewayIP: "100.64.0.3"},
+	}
+	r := Rules("n1", n)
+	for _, want := range []string{
+		"-A PREROUTING -i up0 -d 203.0.113.10/32 -j DNAT --to-destination 10.0.0.5",
+		"-A POSTROUTING -s 10.0.0.5/32 -o up0 -j SNAT --to-source 203.0.113.10",
+		"-A FORWARD -i up0 -o vx0 -d 10.0.0.5/32 -j ACCEPT",
+		"-A FORWARD -i vx0 -o up0 -s 10.0.0.5/32 -j ACCEPT",
+	} {
+		if !strings.Contains(r, want+"\n") {
+			t.Errorf("missing %q", want)
+		}
+	}
+	// n3's address is not translated here.
+	if strings.Contains(r, "203.0.113.11") {
+		t.Error("translated another gateway's address")
+	}
+	// SNAT comes before the namespace's own masquerade.
+	if strings.Index(r, "SNAT") > strings.Index(r, "MASQUERADE") {
+		t.Error("SNAT after MASQUERADE")
+	}
+}

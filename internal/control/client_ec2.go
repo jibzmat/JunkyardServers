@@ -410,3 +410,42 @@ func (c *Client) GroupRules(ctx context.Context, req ec2meta.RulesRequest) (*ec2
 	var out ec2meta.SecurityGroup
 	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/groups/rules", req, &out)
 }
+
+// --- Elastic IPs ---
+
+func (c *Client) AllocateAddress(ctx context.Context, req ec2meta.AddressRequest) (*ec2meta.Address, error) {
+	var out ec2meta.Address
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/addresses/allocate", req, &out)
+}
+
+func (c *Client) ReleaseAddress(ctx context.Context, req ec2meta.AddressRequest) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/addresses/release", req, &out)
+}
+
+func (c *Client) AssociateAddress(ctx context.Context, req ec2meta.AddressRequest) (*ec2meta.Address, error) {
+	var out ec2meta.Address
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/addresses/associate", req, &out)
+}
+
+func (c *Client) DisassociateAddress(ctx context.Context, req ec2meta.AddressRequest) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/addresses/disassociate", req, &out)
+}
+
+func (c *Client) Addresses(ctx context.Context, req ec2meta.AddressRequest) ([]ec2meta.Address, error) {
+	var out []ec2meta.Address
+	return out, c.call(ctx, http.MethodPost, "/v1/ec2/addresses/list", req, &out)
+}
+
+// Pool adds public addresses to, or removes them from, the pool (admin).
+func (c *Client) Pool(ctx context.Context, req ec2meta.PoolRequest) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/admin/public-ips", req, &out)
+}
+
+// PublicIPs lists the pool (admin).
+func (c *Client) PublicIPs(ctx context.Context) ([]PoolEntry, error) {
+	var out []PoolEntry
+	return out, c.call(ctx, http.MethodGet, "/v1/admin/public-ips", nil, &out)
+}

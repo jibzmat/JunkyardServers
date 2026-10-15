@@ -55,6 +55,14 @@ func Rules(node string, n ec2meta.VPCNet) string {
 	w(":INPUT ACCEPT [0:0]")
 	w(":OUTPUT ACCEPT [0:0]")
 	w(":POSTROUTING ACCEPT [0:0]")
+	// Elastic IPs this PC is the gateway of: traffic for the public
+	// address goes to the instance, and the instance's traffic out leaves
+	// from it (see eip.go).
+	eips := gatewayEIPs(node, n)
+	for _, e := range eips {
+		w("-A PREROUTING -i %s -d %s/32 -j DNAT --to-destination %s", uplink, e.PublicIP, e.PrivateIP)
+		w("-A POSTROUTING -s %s/32 -o %s -j SNAT --to-source %s", e.PrivateIP, uplink, e.PublicIP)
+	}
 	w("-A POSTROUTING -o %s -j MASQUERADE", uplink)
 	w("COMMIT")
 
@@ -71,6 +79,12 @@ func Rules(node string, n ec2meta.VPCNet) string {
 	w("-A INPUT -i jy+ -d %s/32 -p tcp --dport 80 -j ACCEPT", MetadataIP)
 	w("-A FORWARD -m conntrack --ctstate INVALID -j DROP")
 	w("-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
+	for _, e := range eips {
+		// To and from an instance on another PC; its own PC applies its
+		// security groups.
+		w("-A FORWARD -i %s -o %s -d %s/32 -j ACCEPT", uplink, vxlanDev, e.PrivateIP)
+		w("-A FORWARD -i %s -o %s -s %s/32 -j ACCEPT", vxlanDev, uplink, e.PrivateIP)
+	}
 	for _, ep := range local {
 		tap := TapName(ep.Instance)
 		w("-A FORWARD -i %s ! -s %s/32 -j DROP", tap, ep.IP)

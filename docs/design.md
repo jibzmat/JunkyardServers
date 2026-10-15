@@ -261,9 +261,26 @@ instances reach the internet through NAT.
 - Draining marks a member `Drained`: it is not eligible for new instances
   or replicas, and the scheduler migrates its running instances to their
   replicas.
+- After the target answers, the old host's paused copy may still have
+  mirrors reconnecting; the target refuses them, so no blank copy is made
+  of a disk it now runs. The source deletes its out-of-date disk files.
 - Measured on two PCs under emulation: 3 to 6 seconds end to end for a
   1 GiB guest, with the guest's own clock showing under a second of
   pause.
+
+- Elastic IPs: the owner lists public addresses and the PC each reaches
+  (the pool). Tenants allocate addresses from it and associate them with
+  instances (`eipalloc-`/`eipassoc-` IDs, one address per instance, a
+  new association replaces the old, terminating frees it). Each VPC's
+  network view lists its addresses in use, with the gateway PC and its
+  mesh address, and the gateway PC gets the VPC's view even with no
+  instance of it. On the gateway: a route for the address to the VPC
+  namespace, proxy ARP on the LAN the address belongs to, and in the
+  namespace DNAT to the instance and SNAT of the instance's traffic out.
+  On the instance's PC, when that is another one: a source rule sends
+  the instance's traffic (except to the VPC) over VXLAN to the gateway,
+  so replies and new connections leave from the address. Security groups
+  apply on the instance's PC as for any traffic.
 
 ## Roadmap
 
