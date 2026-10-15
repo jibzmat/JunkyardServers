@@ -190,7 +190,7 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   PCs first, so with enough of them every chunk can be read even if all
   strangers' PCs disappear at once.
 
-## What M5 adds so far: live migration and elastic IPs
+## What M5 adds so far: live migration, elastic IPs and NAT gateways
 
 - `jyctl migrate <instance-id>` moves a running instance to its second PC
   (the one holding the live copy of its disks) without stopping it: the
@@ -218,7 +218,24 @@ aws ec2 run-instances … --subnet-id subnet-… --security-group-ids sg-…
   internet leaves from the address too. `DescribeInstances` and the
   metadata service show it. Terminating the instance frees the address;
   `release-address` returns it to the pool.
-- Still to come in M5: cluster instances and a NAT gateway.
+- NAT gateways and route tables: a private subnet's instances reach the
+  internet from one elastic IP, wherever they run, and can't be reached
+  from it:
+
+  ```sh
+  aws ec2 create-nat-gateway --subnet-id subnet-<public> --allocation-id eipalloc-...
+  aws ec2 create-route-table --vpc-id vpc-...
+  aws ec2 create-route --route-table-id rtb-... --destination-cidr-block 0.0.0.0/0 --nat-gateway-id nat-...
+  aws ec2 associate-route-table --route-table-id rtb-... --subnet-id subnet-<private>
+  ```
+
+  Every VPC has a main route table and an internet gateway from the
+  start (`describe-route-tables`, `describe-internet-gateways`); its
+  default route sends traffic out through each instance's own PC, as
+  before. A table without a default route, or one to a deleted NAT
+  gateway (a blackhole), gives its subnets no internet. An instance's
+  own elastic IP wins over its subnet's NAT gateway.
+- Still to come in M5: cluster instances.
 
 ## Try it
 
@@ -301,8 +318,12 @@ M5:
 - The console output from before a migration stays on the old PC.
 - Right after a migration, other PCs can't reach the instance for a few
   seconds, until they see where it went.
-- An elastic IP works only while the PC holding it is up, and instances
-  can't reach their own VPC's elastic IPs from inside it.
+- An elastic IP or NAT gateway works only while the PC holding its
+  address is up, and instances can't reach their own VPC's elastic IPs
+  from inside it.
+- Route tables hold only the default route (0.0.0.0/0); traffic inside
+  the VPC always stays local. Private NAT gateways, and associating a
+  table with a gateway, aren't supported.
 
 M4:
 
@@ -315,9 +336,9 @@ M4:
 
 M3:
 
-- Route tables, internet gateways, network ACLs, VPC peering and extra
-  network interfaces answer `InvalidAction`. Every subnet routes to the
-  internet through its PC's NAT.
+- Network ACLs, VPC peering and extra network interfaces answer
+  `InvalidAction`. (Route tables and NAT gateways came in M5; creating
+  or attaching internet gateways isn't needed, as every VPC has one.)
 - IPv6.
 - Internet NAT is untested here (the test machine had no internet).
 

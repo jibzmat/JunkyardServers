@@ -197,7 +197,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		opCreateVolume, opDeleteVolume, opAttachVolume, opDetachVolume, opVolumeReport,
 		opCreateSnapshot, opDeleteSnapshot, opCreateImage, opTaskDone, opTaskFailed,
 		opSetReplica, opReplicaReport, opFailover, opMoveVolume, opMigrate, opMigrated, opDrain,
-		opAllocateAddress, opReleaseAddress, opAssociateAddress, opDisassociateAddress, opPool:
+		opAllocateAddress, opReleaseAddress, opAssociateAddress, opDisassociateAddress, opPool,
+		opCreateRouteTable, opDeleteRouteTable, opRoute, opAssociateRT, opDisassociateRT, opCreateNat, opDeleteNat:
 		res, err = f.applyEC2(c)
 		if err == nil {
 			f.tidyAddresses()

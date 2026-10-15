@@ -428,6 +428,7 @@ func (s *Server) Handler() http.Handler {
 	s.ec2Routes(mux)
 	s.vpcRoutes(mux)
 	s.addressRoutes(mux)
+	s.routeRoutes(mux)
 	s.ec2StorageRoutes(mux)
 	s.keyRoutes(mux)
 	return mux

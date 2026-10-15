@@ -28,11 +28,13 @@ import (
 const eipProto = "77"
 
 // Source rules on an instance's PC: the main table first, except for its
-// default route, then a table per elastic IP that sends the rest to the
-// gateway.
+// default route, then a table per elastic IP, then one per subnet routed
+// to a NAT gateway on another PC, each sending the rest to that gateway.
+// An instance's own elastic IP wins over its subnet's NAT gateway.
 const (
 	prefMain = "100"
 	prefEIP  = "200"
+	prefNAT  = "300"
 	eipTable = 1000
 )
 
@@ -47,26 +49,56 @@ func gatewayEIPs(node string, n ec2meta.VPCNet) []ec2meta.ElasticIP {
 	return out
 }
 
-// syncEIPRoutes sends the traffic of this PC's instances that have an
-// elastic IP held by another PC to that PC.
-func (m *Manager) syncEIPRoutes(ctx context.Context, ns, node, meshIP string, n ec2meta.VPCNet) error {
-	if meshIP == "" {
-		return nil
+// gatewayNATs are the subnets of n whose NAT gateway's address node holds.
+func gatewayNATs(node string, n ec2meta.VPCNet) []ec2meta.SubnetEgress {
+	var out []ec2meta.SubnetEgress
+	for _, e := range n.Egress {
+		if !e.None && e.Gateway == node {
+			out = append(out, e)
+		}
 	}
+	return out
+}
+
+// sourceRoute sends traffic from From to the internet through Via.
+type sourceRoute struct{ Pref, From, Via string }
+
+// sourceRoutes are this PC's source rules for n.
+func sourceRoutes(node string, n ec2meta.VPCNet) []sourceRoute {
 	local := map[string]bool{}
 	for _, ep := range n.Endpoints {
 		if ep.Host == node {
 			local[ep.Instance] = true
 		}
 	}
-	type route struct{ From, Via string }
-	var want []route
+	var want []sourceRoute
 	for _, e := range n.EIPs {
 		if local[e.Instance] && e.Gateway != node && e.GatewayIP != "" {
-			want = append(want, route{e.PrivateIP, e.GatewayIP})
+			want = append(want, sourceRoute{prefEIP, e.PrivateIP + "/32", e.GatewayIP})
 		}
 	}
-	sort.Slice(want, func(i, j int) bool { return want[i].From < want[j].From })
+	for _, e := range n.Egress {
+		if !e.None && e.Gateway != node && e.GatewayIP != "" {
+			want = append(want, sourceRoute{prefNAT, e.CIDR, e.GatewayIP})
+		}
+	}
+	sort.Slice(want, func(i, j int) bool {
+		if want[i].Pref != want[j].Pref {
+			return want[i].Pref < want[j].Pref
+		}
+		return want[i].From < want[j].From
+	})
+	return want
+}
+
+// syncSourceRoutes sends the internet traffic of this PC's instances that
+// have an elastic IP, or whose subnet has a NAT gateway, held by another
+// PC to that PC.
+func (m *Manager) syncSourceRoutes(ctx context.Context, ns, node, meshIP string, n ec2meta.VPCNet) error {
+	if meshIP == "" {
+		return nil
+	}
+	want := sourceRoutes(node, n)
 	key := "eip/" + n.VPC.ID
 	h, changed := m.changed(key, want)
 	if !changed {
@@ -84,11 +116,11 @@ func (m *Manager) syncEIPRoutes(ctx context.Context, ns, node, meshIP string, n 
 	_ = json.Unmarshal(out, &rules)
 	for _, r := range rules {
 		p := fmt.Sprint(r.Priority)
-		if p != prefMain && p != prefEIP {
+		if p != prefMain && p != prefEIP && p != prefNAT {
 			continue
 		}
 		_ = run(ctx, "ip", "-n", ns, "rule", "del", "pref", p)
-		if p == prefEIP {
+		if p != prefMain {
 			_ = run(ctx, "ip", "-n", ns, "route", "flush", "table", r.Table)
 		}
 	}
@@ -104,7 +136,7 @@ func (m *Manager) syncEIPRoutes(ctx context.Context, ns, node, meshIP string, n 
 			{"ip", "-n", ns, "neigh", "replace", r.Via, "lladdr", mac, "dev", vxlanDev, "nud", "permanent"},
 			{"bridge", "-n", ns, "fdb", "replace", mac, "dev", vxlanDev, "dst", r.Via, "self", "permanent"},
 			{"ip", "-n", ns, "route", "replace", "default", "via", r.Via, "dev", vxlanDev, "onlink", "table", table},
-			{"ip", "-n", ns, "rule", "add", "pref", prefEIP, "from", r.From + "/32", "lookup", table},
+			{"ip", "-n", ns, "rule", "add", "pref", r.Pref, "from", r.From, "lookup", table},
 		}
 		for _, s := range steps {
 			if err := run(ctx, s[0], s[1:]...); err != nil {
@@ -117,14 +149,20 @@ func (m *Manager) syncEIPRoutes(ctx context.Context, ns, node, meshIP string, n 
 }
 
 // syncPublic is the gateway PC's own side: each public address it holds
-// is routed to its VPC's namespace, answered for on the LAN it belongs to
+// for an elastic IP or a NAT gateway is routed to its VPC's namespace, answered for on the LAN it belongs to
 // (proxy ARP), and let through to the namespace.
 func (m *Manager) syncPublic(ctx context.Context, node string, nets []ec2meta.VPCNet) error {
 	type pub struct{ IP, Veth, Via, Dev string }
 	var want []pub
 	for _, n := range nets {
-		eips := gatewayEIPs(node, n)
-		if len(eips) == 0 {
+		var ips []string
+		for _, e := range gatewayEIPs(node, n) {
+			ips = append(ips, e.PublicIP)
+		}
+		for _, e := range gatewayNATs(node, n) {
+			ips = append(ips, e.PublicIP)
+		}
+		if len(ips) == 0 {
 			continue
 		}
 		idx, err := m.indexFor(n.VPC.ID)
@@ -132,17 +170,19 @@ func (m *Manager) syncPublic(ctx context.Context, node string, nets []ec2meta.VP
 			return err
 		}
 		_, nsIP := transitAddrs(idx)
-		for _, e := range eips {
-			a, err := netip.ParseAddr(e.PublicIP)
-			if err != nil {
+		seen := map[string]bool{}
+		for _, ip := range ips {
+			a, err := netip.ParseAddr(ip)
+			if err != nil || seen[ip] {
 				continue
 			}
+			seen[ip] = true
 			dev, local := lanFor(a)
 			if local {
-				m.logf("vnet: %s is this PC's own address, so it can't be an elastic IP here", e.PublicIP)
+				m.logf("vnet: %s is this PC's own address, so it can't be an elastic IP here", ip)
 				continue
 			}
-			want = append(want, pub{e.PublicIP, fmt.Sprintf("jyv%x", idx), nsIP.String(), dev})
+			want = append(want, pub{ip, fmt.Sprintf("jyv%x", idx), nsIP.String(), dev})
 		}
 	}
 	sort.Slice(want, func(i, j int) bool { return want[i].IP < want[j].IP })

@@ -63,6 +63,12 @@ func Rules(node string, n ec2meta.VPCNet) string {
 		w("-A PREROUTING -i %s -d %s/32 -j DNAT --to-destination %s", uplink, e.PublicIP, e.PrivateIP)
 		w("-A POSTROUTING -s %s/32 -o %s -j SNAT --to-source %s", e.PrivateIP, uplink, e.PublicIP)
 	}
+	// NAT gateways this PC holds the address of: the subnet's traffic out
+	// leaves from it, unless an instance has its own elastic IP.
+	nats := gatewayNATs(node, n)
+	for _, e := range nats {
+		w("-A POSTROUTING -s %s -o %s -j SNAT --to-source %s", e.CIDR, uplink, e.PublicIP)
+	}
 	w("-A POSTROUTING -o %s -j MASQUERADE", uplink)
 	w("COMMIT")
 
@@ -85,6 +91,9 @@ func Rules(node string, n ec2meta.VPCNet) string {
 		w("-A FORWARD -i %s -o %s -d %s/32 -j ACCEPT", uplink, vxlanDev, e.PrivateIP)
 		w("-A FORWARD -i %s -o %s -s %s/32 -j ACCEPT", vxlanDev, uplink, e.PrivateIP)
 	}
+	for _, e := range nats {
+		w("-A FORWARD -i %s -o %s -s %s -j ACCEPT", vxlanDev, uplink, e.CIDR)
+	}
 	for _, ep := range local {
 		tap := TapName(ep.Instance)
 		w("-A FORWARD -i %s ! -s %s/32 -j DROP", tap, ep.IP)
@@ -92,6 +101,24 @@ func Rules(node string, n ec2meta.VPCNet) string {
 	}
 	for _, ep := range local {
 		w("-A FORWARD -o %s -j %s", TapName(ep.Instance), chainName("I", ep.Instance))
+	}
+	// Subnets without a route out here: no internet from this PC, except
+	// for instances whose elastic IP or NAT gateway this PC holds.
+	blocked := false
+	for _, e := range n.Egress {
+		if e.None || e.Gateway != node {
+			blocked = true
+		}
+	}
+	if blocked {
+		for _, e := range eips {
+			w("-A FORWARD -s %s/32 -o %s -j ACCEPT", e.PrivateIP, uplink)
+		}
+		for _, e := range n.Egress {
+			if e.None || e.Gateway != node {
+				w("-A FORWARD -s %s -o %s -j DROP", e.CIDR, uplink)
+			}
+		}
 	}
 	// Past its egress check: to an instance on another PC, or out.
 	w("-A FORWARD -i jy+ -j ACCEPT")

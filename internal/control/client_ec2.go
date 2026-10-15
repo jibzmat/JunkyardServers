@@ -449,3 +449,54 @@ func (c *Client) PublicIPs(ctx context.Context) ([]PoolEntry, error) {
 	var out []PoolEntry
 	return out, c.call(ctx, http.MethodGet, "/v1/admin/public-ips", nil, &out)
 }
+
+// --- Route tables and NAT gateways ---
+
+func (c *Client) CreateRouteTable(ctx context.Context, req ec2meta.RouteRequest) (*ec2meta.RouteTable, error) {
+	var out ec2meta.RouteTable
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/route-tables/create", req, &out)
+}
+
+func (c *Client) DeleteRouteTable(ctx context.Context, req ec2meta.RouteRequest) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/route-tables/delete", req, &out)
+}
+
+// SetRoute creates, replaces or (with no Route) deletes a default route.
+func (c *Client) SetRoute(ctx context.Context, req ec2meta.RouteRequest) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/route-tables/route", req, &out)
+}
+
+func (c *Client) AssociateRouteTable(ctx context.Context, req ec2meta.RouteRequest) (string, error) {
+	var out struct {
+		ID string `json:"id"`
+	}
+	err := c.call(ctx, http.MethodPost, "/v1/ec2/route-tables/associate", req, &out)
+	return out.ID, err
+}
+
+func (c *Client) DisassociateRouteTable(ctx context.Context, req ec2meta.RouteRequest) error {
+	var out struct{}
+	return c.call(ctx, http.MethodPost, "/v1/ec2/route-tables/disassociate", req, &out)
+}
+
+func (c *Client) RouteTables(ctx context.Context, req ec2meta.RouteRequest) ([]ec2meta.RouteTable, error) {
+	var out []ec2meta.RouteTable
+	return out, c.call(ctx, http.MethodPost, "/v1/ec2/route-tables/list", req, &out)
+}
+
+func (c *Client) CreateNatGateway(ctx context.Context, req ec2meta.RouteRequest) (*ec2meta.NatGateway, error) {
+	var out ec2meta.NatGateway
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/nat-gateways/create", req, &out)
+}
+
+func (c *Client) DeleteNatGateway(ctx context.Context, req ec2meta.RouteRequest) (*ec2meta.NatGateway, error) {
+	var out ec2meta.NatGateway
+	return &out, c.call(ctx, http.MethodPost, "/v1/ec2/nat-gateways/delete", req, &out)
+}
+
+func (c *Client) NatGateways(ctx context.Context, req ec2meta.RouteRequest) ([]ec2meta.NatGateway, error) {
+	var out []ec2meta.NatGateway
+	return out, c.call(ctx, http.MethodPost, "/v1/ec2/nat-gateways/list", req, &out)
+}

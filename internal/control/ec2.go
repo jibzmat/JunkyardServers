@@ -76,6 +76,7 @@ type ec2Command struct {
 	Migration     *ec2meta.MigrationReport `json:"migration,omitempty"`
 	Address       *ec2meta.Address         `json:"address,omitempty"`
 	Pool          *ec2meta.PoolRequest     `json:"pool,omitempty"`
+	Routes        *routeCommand            `json:"routes,omitempty"`
 }
 
 // ec2State is the EC2 part of the replicated state.
@@ -93,6 +94,9 @@ type ec2State struct {
 	// they come from, by address.
 	Addresses map[string]*ec2meta.Address  `json:"addresses"`
 	PublicIPs map[string]*ec2meta.PublicIP `json:"public_ips"`
+	// RouteTables holds created tables, and main ones once changed.
+	RouteTables map[string]*ec2meta.RouteTable `json:"route_tables"`
+	NatGateways map[string]*ec2meta.NatGateway `json:"nat_gateways"`
 	// NextVNI is the next VXLAN identifier to give a VPC.
 	NextVNI uint32 `json:"next_vni"`
 }
@@ -106,6 +110,12 @@ func (e *ec2State) fill() {
 	}
 	if e.PublicIPs == nil {
 		e.PublicIPs = map[string]*ec2meta.PublicIP{}
+	}
+	if e.RouteTables == nil {
+		e.RouteTables = map[string]*ec2meta.RouteTable{}
+	}
+	if e.NatGateways == nil {
+		e.NatGateways = map[string]*ec2meta.NatGateway{}
 	}
 	if e.KeyPairs == nil {
 		e.KeyPairs = map[string]*ec2meta.KeyPair{}
@@ -155,6 +165,9 @@ func (f *fsm) applyEC2(c command) (any, error) {
 		return res, err
 	}
 	if res, ok, err := f.applyAddress(c); ok {
+		return res, err
+	}
+	if res, ok, err := f.applyRoutes(c); ok {
 		return res, err
 	}
 	switch c.Op {
@@ -449,6 +462,12 @@ func hasResource(e *ec2State, tenant, id string) bool {
 	case strings.HasPrefix(id, "eipalloc-"):
 		v, ok := e.Addresses[id]
 		return ok && v.Tenant == tenant
+	case strings.HasPrefix(id, "rtb-"):
+		_, err := routeTable(e, tenant, id)
+		return err == nil
+	case strings.HasPrefix(id, "nat-"):
+		v, ok := e.NatGateways[id]
+		return ok && v.Tenant == tenant
 	}
 	return false
 }
@@ -508,6 +527,15 @@ func setTags(e *ec2State, tenant, id string, tags map[string]string, del bool) {
 		n := *e.Addresses[id]
 		n.Tags = mergeTags(n.Tags, tags, del)
 		e.Addresses[id] = &n
+	case strings.HasPrefix(id, "rtb-"):
+		t, _ := routeTable(e, tenant, id)
+		n := copyTable(t)
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.RouteTables[id] = &n
+	case strings.HasPrefix(id, "nat-"):
+		n := *e.NatGateways[id]
+		n.Tags = mergeTags(n.Tags, tags, del)
+		e.NatGateways[id] = &n
 	case strings.HasPrefix(id, "key-"):
 		for name, k := range e.KeyPairs {
 			if k.ID == id && k.Tenant == tenant {
@@ -1006,6 +1034,9 @@ func (s *Server) HostView(host string) ec2meta.HostView {
 		}
 		for _, id := range gatewayVPCs(st, host) {
 			vpcs[id] = true // it passes traffic for an elastic IP there
+		}
+		for _, id := range natVPCs(st, host) {
+			vpcs[id] = true // and for a NAT gateway
 		}
 		for _, in := range st.EC2.Instances {
 			// A running instance migrating here: the host gets ready to

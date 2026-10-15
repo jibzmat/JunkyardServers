@@ -116,11 +116,22 @@ func (f *fsm) applyVPC(c command) (any, bool, error) {
 				return nil, true, errCode(ec2meta.CodeDependency, "the vpc '%s' has dependencies (security group %s) and cannot be deleted", vpc.ID, g.ID)
 			}
 		}
+		for _, t := range e.RouteTables {
+			if t.VpcID == vpc.ID && !t.Main {
+				return nil, true, errCode(ec2meta.CodeDependency, "the vpc '%s' has dependencies (route table %s) and cannot be deleted", vpc.ID, t.ID)
+			}
+		}
+		for _, g := range e.NatGateways {
+			if g.VpcID == vpc.ID && g.State != ec2meta.NatDeleted {
+				return nil, true, errCode(ec2meta.CodeDependency, "the vpc '%s' has dependencies (NAT gateway %s) and cannot be deleted", vpc.ID, g.ID)
+			}
+		}
 		for id, g := range e.Groups {
 			if g.VpcID == vpc.ID {
 				delete(e.Groups, id)
 			}
 		}
+		delete(e.RouteTables, ec2meta.MainRouteTable(vpc.ID))
 		delete(e.VPCs, vpc.ID)
 		return nil, true, nil
 
@@ -152,6 +163,22 @@ func (f *fsm) applyVPC(c command) (any, bool, error) {
 		for _, in := range e.Instances {
 			if in.SubnetID == sn.ID && in.State != ec2meta.StateTerminated {
 				return nil, true, errCode(ec2meta.CodeDependency, "the subnet '%s' has dependencies (instance %s) and cannot be deleted", sn.ID, in.ID)
+			}
+		}
+		for _, g := range e.NatGateways {
+			if g.SubnetID == sn.ID && g.State != ec2meta.NatDeleted {
+				return nil, true, errCode(ec2meta.CodeDependency, "the subnet '%s' has dependencies (NAT gateway %s) and cannot be deleted", sn.ID, g.ID)
+			}
+		}
+		// Its route table association goes with it.
+		for id, t := range e.RouteTables {
+			for i, a := range t.Associations {
+				if a.Subnet == sn.ID {
+					n := copyTable(t)
+					n.Associations = append(n.Associations[:i:i], n.Associations[i+1:]...)
+					e.RouteTables[id] = &n
+					break
+				}
 			}
 		}
 		delete(e.Subnets, sn.ID)
@@ -388,6 +415,7 @@ func vpcNet(st *state, id, host string) (ec2meta.VPCNet, bool) {
 		n.Members[r] = ips
 	}
 	n.EIPs = vpcEIPs(st, id)
+	n.Egress = vpcEgress(st, id)
 	sort.Slice(n.Subnets, func(i, j int) bool { return n.Subnets[i].ID < n.Subnets[j].ID })
 	sort.Slice(n.Endpoints, func(i, j int) bool { return n.Endpoints[i].Instance < n.Endpoints[j].Instance })
 	sort.Slice(n.Groups, func(i, j int) bool { return n.Groups[i].ID < n.Groups[j].ID })

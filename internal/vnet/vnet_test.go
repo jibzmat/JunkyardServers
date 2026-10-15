@@ -111,3 +111,47 @@ func TestEIPRules(t *testing.T) {
 		t.Error("SNAT after MASQUERADE")
 	}
 }
+
+func TestNATRules(t *testing.T) {
+	n := testNet()
+	n.Egress = []ec2meta.SubnetEgress{
+		{CIDR: "10.0.1.0/24", NAT: "nat-1", PublicIP: "203.0.113.11", Gateway: "n1", GatewayIP: "100.64.0.1"},
+		{CIDR: "10.0.2.0/24", None: true},
+	}
+	n.EIPs = []ec2meta.ElasticIP{{PublicIP: "203.0.113.10", PrivateIP: "10.0.2.9", Instance: "i-0000000000000000c", Gateway: "n1", GatewayIP: "100.64.0.1"}}
+	r := Rules("n1", n)
+	for _, want := range []string{
+		"-A POSTROUTING -s 10.0.1.0/24 -o up0 -j SNAT --to-source 203.0.113.11",
+		"-A FORWARD -i vx0 -o up0 -s 10.0.1.0/24 -j ACCEPT",
+		"-A FORWARD -s 10.0.2.9/32 -o up0 -j ACCEPT",
+		"-A FORWARD -s 10.0.2.0/24 -o up0 -j DROP",
+	} {
+		if !strings.Contains(r, want+"\n") {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if strings.Contains(r, "-s 10.0.1.0/24 -o up0 -j DROP") {
+		t.Error("blocked the NAT gateway's own subnet on its PC")
+	}
+	// An elastic IP's SNAT wins over the NAT gateway's.
+	if strings.Index(r, "--to-source 203.0.113.10") > strings.Index(r, "--to-source 203.0.113.11") {
+		t.Error("NAT gateway SNAT before the elastic IP's")
+	}
+	if strings.Index(r, "-s 10.0.2.0/24 -o up0 -j DROP") > strings.Index(r, "-A FORWARD -i jy+ -j ACCEPT") {
+		t.Error("drop after the final accept")
+	}
+
+	// On another PC, the NAT subnet is sent to n1 and blocked locally.
+	r = Rules("n2", n)
+	if !strings.Contains(r, "-A FORWARD -s 10.0.1.0/24 -o up0 -j DROP\n") || strings.Contains(r, "SNAT") {
+		t.Errorf("n2 rules wrong:\n%s", r)
+	}
+	got := sourceRoutes("n2", n)
+	want := []sourceRoute{{prefNAT, "10.0.1.0/24", "100.64.0.1"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("source routes on n2 = %v, want %v", got, want)
+	}
+	if got := sourceRoutes("n1", n); len(got) != 0 {
+		t.Errorf("source routes on the gateway = %v", got)
+	}
+}

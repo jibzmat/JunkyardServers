@@ -139,6 +139,8 @@ type VPCNet struct {
 	Members   map[string][]string `json:"members"`   // group ID -> addresses, for groups rules name
 	// EIPs are the VPC's elastic IPs in use.
 	EIPs []ElasticIP `json:"eips,omitempty"`
+	// Egress lists the subnets not routed out through their PCs' NAT.
+	Egress []SubnetEgress `json:"egress,omitempty"`
 }
 
 // ElasticIP is a public address in use, as the PCs route it: the gateway
@@ -220,6 +222,12 @@ const (
 	CodeAddressLimit       = "AddressLimitExceeded"
 	CodeAlreadyAssociated  = "Resource.AlreadyAssociated"
 	CodeAddressInUse       = "InvalidIPAddress.InUse"
+	CodeRouteTableNotFound = "InvalidRouteTableID.NotFound"
+	CodeNatNotFound        = "NatGatewayNotFound"
+	CodeRouteNotFound      = "InvalidRoute.NotFound"
+	CodeRouteExists        = "RouteAlreadyExists"
+	CodeRTAssocNotFound    = "InvalidAssociationID.NotFound"
+	CodeGatewayNotFound    = "InvalidGatewayID.NotFound"
 )
 
 // Elastic IPs (M5).
@@ -244,6 +252,8 @@ type Address struct {
 	AssociationID string `json:"association_id,omitempty"`
 	Instance      string `json:"instance,omitempty"`
 	PrivateIP     string `json:"private_ip,omitempty"`
+	// NatGateway is set instead of Instance when a NAT gateway uses it.
+	NatGateway string `json:"nat_gateway,omitempty"`
 }
 
 // AddressRequest allocates, finds, associates or releases addresses.
@@ -263,4 +273,91 @@ type PoolRequest struct {
 	Node   string   `json:"node,omitempty"`
 	IPs    []string `json:"ips"`
 	Remove bool     `json:"remove,omitempty"`
+}
+
+// Route tables and NAT gateways (M5). Only the default route
+// (0.0.0.0/0) can be set: to the VPC's internet gateway (out through
+// the instance's own PC), to a NAT gateway, or nowhere (no internet).
+// Traffic inside the VPC always takes the local route.
+
+// DefaultRoute is the one destination route tables take besides local.
+const DefaultRoute = "0.0.0.0/0"
+
+// RouteTable is a VPC's routes and the subnets using them. Every VPC has
+// a main table, used by subnets with no table of their own.
+type RouteTable struct {
+	ID           string            `json:"id"`
+	Tenant       string            `json:"tenant"`
+	VpcID        string            `json:"vpc_id"`
+	Main         bool              `json:"main,omitempty"`
+	Routes       []Route           `json:"routes,omitempty"` // besides local
+	Associations []RouteTableAssoc `json:"associations,omitempty"`
+	Created      time.Time         `json:"created"`
+	Tags         map[string]string `json:"tags,omitempty"`
+}
+
+// Route sends a destination to the internet gateway or a NAT gateway.
+type Route struct {
+	Destination string `json:"destination"`
+	Gateway     string `json:"gateway,omitempty"` // igw-...
+	NatGateway  string `json:"nat_gateway,omitempty"`
+}
+
+// RouteTableAssoc ties a subnet to a table.
+type RouteTableAssoc struct {
+	ID     string `json:"id"`
+	Subnet string `json:"subnet"`
+}
+
+// NatGateway gives a subnet's instances one public address for their
+// traffic out: an elastic IP held by a PC, through which they reach the
+// internet wherever they run.
+type NatGateway struct {
+	ID           string            `json:"id"`
+	Tenant       string            `json:"tenant"`
+	VpcID        string            `json:"vpc_id"`
+	SubnetID     string            `json:"subnet_id"`
+	AllocationID string            `json:"allocation_id"`
+	PublicIP     string            `json:"public_ip"`
+	State        string            `json:"state"` // available, deleted
+	Created      time.Time         `json:"created"`
+	Deleted      time.Time         `json:"deleted,omitempty"`
+	Tags         map[string]string `json:"tags,omitempty"`
+}
+
+const (
+	NatAvailable = "available"
+	NatDeleted   = "deleted"
+)
+
+// MainRouteTable and InternetGateway name a VPC's main route table and
+// its internet gateway, which every VPC has.
+func MainRouteTable(vpc string) string  { return "rtb-" + strings.TrimPrefix(vpc, "vpc-") }
+func InternetGateway(vpc string) string { return "igw-" + strings.TrimPrefix(vpc, "vpc-") }
+
+// RouteRequest changes or lists route tables and NAT gateways.
+type RouteRequest struct {
+	Tenant        string            `json:"tenant"`
+	IDs           []string          `json:"ids,omitempty"`
+	VpcID         string            `json:"vpc_id,omitempty"`
+	TableID       string            `json:"table_id,omitempty"`
+	SubnetID      string            `json:"subnet_id,omitempty"`
+	AssociationID string            `json:"association_id,omitempty"`
+	Route         *Route            `json:"route,omitempty"`
+	Replace       bool              `json:"replace,omitempty"`
+	AllocationID  string            `json:"allocation_id,omitempty"`
+	Tags          map[string]string `json:"tags,omitempty"`
+}
+
+// SubnetEgress is how a subnet that doesn't go out through its PCs'
+// own NAT reaches the internet: through a NAT gateway, or not at all.
+type SubnetEgress struct {
+	CIDR string `json:"cidr"`
+	// None blocks traffic out of the VPC; otherwise it goes to the NAT
+	// gateway's address on Gateway.
+	None      bool   `json:"none,omitempty"`
+	NAT       string `json:"nat,omitempty"`
+	PublicIP  string `json:"public_ip,omitempty"`
+	Gateway   string `json:"gateway,omitempty"`
+	GatewayIP string `json:"gateway_ip,omitempty"`
 }

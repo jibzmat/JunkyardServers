@@ -281,6 +281,20 @@ instances reach the internet through NAT.
   the instance's traffic (except to the VPC) over VXLAN to the gateway,
   so replies and new connections leave from the address. Security groups
   apply on the instance's PC as for any traffic.
+- NAT gateways and route tables: each VPC has a main route table
+  (`rtb-<VPC suffix>`) and internet gateway (`igw-<VPC suffix>`) that
+  exist without being created; the main table is stored once changed.
+  A table holds at most the default route: to the internet gateway
+  (each PC's own NAT), to a NAT gateway (`nat-`, on an elastic IP), or
+  none. A VPC's network view lists, per subnet not using the internet
+  gateway, either "no internet" or the NAT gateway's address, PC and
+  mesh address; that PC gets the VPC's view. On it: the address's route,
+  proxy ARP and SNAT of the subnet's traffic out (after per-instance
+  elastic IP SNAT), as for an elastic IP. On other PCs: a source rule
+  (after the per-instance ones) sends the subnet's traffic out over
+  VXLAN to it. Traffic from a subnet with no way out from this PC is
+  dropped before the namespace's uplink, so a missing or deleted route
+  can't fall back to the PC's own NAT.
 
 ## Roadmap
 

@@ -69,6 +69,16 @@ type EC2Meta interface {
 	AssociateAddress(ctx context.Context, req ec2meta.AddressRequest) (*ec2meta.Address, error)
 	DisassociateAddress(ctx context.Context, req ec2meta.AddressRequest) error
 	Addresses(ctx context.Context, req ec2meta.AddressRequest) ([]ec2meta.Address, error)
+
+	CreateRouteTable(ctx context.Context, req ec2meta.RouteRequest) (*ec2meta.RouteTable, error)
+	DeleteRouteTable(ctx context.Context, req ec2meta.RouteRequest) error
+	SetRoute(ctx context.Context, req ec2meta.RouteRequest) error
+	AssociateRouteTable(ctx context.Context, req ec2meta.RouteRequest) (string, error)
+	DisassociateRouteTable(ctx context.Context, req ec2meta.RouteRequest) error
+	RouteTables(ctx context.Context, req ec2meta.RouteRequest) ([]ec2meta.RouteTable, error)
+	CreateNatGateway(ctx context.Context, req ec2meta.RouteRequest) (*ec2meta.NatGateway, error)
+	DeleteNatGateway(ctx context.Context, req ec2meta.RouteRequest) (*ec2meta.NatGateway, error)
+	NatGateways(ctx context.Context, req ec2meta.RouteRequest) ([]ec2meta.NatGateway, error)
 }
 
 const ec2NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
@@ -294,6 +304,30 @@ func (g *Gateway) serveEC2(q *request) error {
 		return g.releaseAddress(q, p)
 	case "DescribeAddresses":
 		return g.describeAddresses(q, p)
+	case "CreateRouteTable":
+		return g.createRouteTable(q, p)
+	case "DeleteRouteTable":
+		return g.deleteRouteTable(q, p)
+	case "DescribeRouteTables":
+		return g.describeRouteTables(q, p)
+	case "CreateRoute":
+		return g.setRoute(q, p, "CreateRouteResponse")
+	case "ReplaceRoute":
+		return g.setRoute(q, p, "ReplaceRouteResponse")
+	case "DeleteRoute":
+		return g.setRoute(q, p, "DeleteRouteResponse")
+	case "AssociateRouteTable":
+		return g.associateRouteTable(q, p)
+	case "DisassociateRouteTable":
+		return g.disassociateRouteTable(q, p)
+	case "CreateNatGateway":
+		return g.createNatGateway(q, p)
+	case "DeleteNatGateway":
+		return g.deleteNatGateway(q, p)
+	case "DescribeNatGateways":
+		return g.describeNatGateways(q, p)
+	case "DescribeInternetGateways":
+		return g.describeInternetGateways(q, p)
 	case "GetConsoleOutput":
 		c, err := g.EC2.Console(q.ctx, q.tenant, p.Get("InstanceId"))
 		if err != nil {

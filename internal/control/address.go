@@ -86,8 +86,8 @@ func (f *fsm) applyAddress(c command) (any, bool, error) {
 		if !ok || old.Tenant != c.Owner {
 			return nil, true, errCode(ec2meta.CodeAllocationNotFound, "the allocation ID '%s' does not exist", a.AllocationID)
 		}
-		if old.Instance != "" {
-			return nil, true, errCode(ec2meta.CodeAddressInUse, "the address %s is associated with %s", old.PublicIP, old.Instance)
+		if old.Instance != "" || old.NatGateway != "" {
+			return nil, true, errCode(ec2meta.CodeAddressInUse, "the address %s is associated with %s", old.PublicIP, old.Instance+old.NatGateway)
 		}
 		delete(e.Addresses, old.AllocationID)
 		return nil, true, nil
@@ -96,6 +96,9 @@ func (f *fsm) applyAddress(c command) (any, bool, error) {
 		old, ok := e.Addresses[a.AllocationID]
 		if !ok || old.Tenant != c.Owner {
 			return nil, true, errCode(ec2meta.CodeAllocationNotFound, "the allocation ID '%s' does not exist", a.AllocationID)
+		}
+		if old.NatGateway != "" {
+			return nil, true, errCode(ec2meta.CodeAddressInUse, "the address %s belongs to the NAT gateway %s", old.PublicIP, old.NatGateway)
 		}
 		in, ok := e.Instances[a.Instance]
 		if !ok || in.Tenant != c.Owner || in.State == ec2meta.StateTerminated || in.State == ec2meta.StateShuttingDown {
@@ -120,6 +123,9 @@ func (f *fsm) applyAddress(c command) (any, bool, error) {
 	case opDisassociateAddress:
 		for id, o := range e.Addresses {
 			if o.AssociationID != "" && o.AssociationID == a.AssociationID && o.Tenant == c.Owner {
+				if o.NatGateway != "" {
+					return nil, true, errCode(ec2meta.CodeAddressInUse, "the address %s belongs to the NAT gateway %s; delete that instead", o.PublicIP, o.NatGateway)
+				}
 				d := *o
 				d.Instance, d.PrivateIP, d.AssociationID = "", "", ""
 				e.Addresses[id] = &d

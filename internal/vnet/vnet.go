@@ -343,7 +343,7 @@ func (m *Manager) syncVPC(ctx context.Context, node, meshIP string, n ec2meta.VP
 	if err := m.syncRemote(ctx, ns, node, meshIP, n); err != nil {
 		errs = append(errs, err)
 	}
-	if err := m.syncEIPRoutes(ctx, ns, node, meshIP, n); err != nil {
+	if err := m.syncSourceRoutes(ctx, ns, node, meshIP, n); err != nil {
 		errs = append(errs, err)
 	}
 	for _, ep := range n.Endpoints {
@@ -626,10 +626,10 @@ func (m *Manager) syncVXLANFilter(ctx context.Context, node string, nets []ec2me
 				allow = append(allow, pair{ep.HostIP, n.VPC.VNI})
 			}
 		}
-		for _, e := range n.EIPs {
-			if e.Gateway != node && e.GatewayIP != "" && !seen[e.GatewayIP] {
-				seen[e.GatewayIP] = true
-				allow = append(allow, pair{e.GatewayIP, n.VPC.VNI})
+		for _, r := range sourceRoutes(node, n) {
+			if !seen[r.Via] {
+				seen[r.Via] = true
+				allow = append(allow, pair{r.Via, n.VPC.VNI})
 			}
 		}
 	}
